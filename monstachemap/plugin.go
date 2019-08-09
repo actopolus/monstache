@@ -2,7 +2,6 @@ package monstachemap
 
 import (
 	"github.com/olivere/elastic/v7"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -48,5 +47,5 @@ type ProcessPluginInput struct {
 	MapperPluginInput
 	ElasticClient        *elastic.Client        // Elasticsearch driver client
 	ElasticBulkProcessor *elastic.BulkProcessor // Elasticsearch processor for indexing in bulk
-	Timestamp            primitive.Timestamp    // the timestamp of the event from the oplog
+	Timestamp            int64                  // the timestamp of the event from the oplog
 }

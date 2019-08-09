@@ -19,8 +19,8 @@ import (
 	aws "github.com/olivere/elastic/v7/aws/v4"
 	"github.com/robertkrimen/otto"
 	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
+	"github.com/rwynn/monstache/gtm"
+	"github.com/rwynn/monstache/gtm/consistent"
 	"github.com/rwynn/monstache/monstachemap"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -121,8 +121,8 @@ type indexClient struct {
 	closeC      chan bool
 	doneC       chan int
 	enabled     bool
-	lastTs      primitive.Timestamp
-	lastTsSaved primitive.Timestamp
+	lastTs      int64
+	lastTsSaved int64
 	indexC      chan *gtm.Op
 	processC    chan *gtm.Op
 	fileC       chan *gtm.Op
@@ -967,10 +967,7 @@ func (ic *indexClient) processRelated(root *gtm.Op) (err error) {
 						continue
 					}
 					now := time.Now().UTC()
-					tstamp := primitive.Timestamp{
-						T: uint32(now.Unix()),
-						I: uint32(now.Nanosecond()),
-					}
+					tstamp := now.Unix()
 					rop := &gtm.Op{
 						Id:                doc["_id"],
 						Data:              doc,
@@ -1042,7 +1039,7 @@ func (ic *indexClient) prepareDataForIndexing(op *gtm.Op) {
 	config := ic.config
 	data := op.Data
 	if config.IndexOplogTime {
-		secs := op.Timestamp.T
+		secs := op.Timestamp
 		t := time.Unix(int64(secs), 0).UTC()
 		data[config.OplogTsFieldName] = op.Timestamp
 		data[config.OplogDateFieldName] = t.Format(config.OplogDateFieldFormat)
@@ -1057,7 +1054,7 @@ func (ic *indexClient) prepareDataForIndexing(op *gtm.Op) {
 
 func parseIndexMeta(op *gtm.Op) (meta *indexingMeta) {
 	meta = &indexingMeta{
-		Version:     tsVersion(op.Timestamp),
+		Version:     op.Timestamp,
 		VersionType: "external",
 	}
 	if m, ok := op.Data["_meta_monstache"]; ok {
@@ -1336,7 +1333,7 @@ func (ic *indexClient) resumeWork() {
 		doc := make(map[string]interface{})
 		if err = result.Decode(&doc); err == nil {
 			if doc["ts"] != nil {
-				ts := doc["ts"].(primitive.Timestamp)
+				ts := doc["ts"].(int64)
 				ic.gtmCtx.Since(ts)
 			}
 		}
@@ -1731,6 +1728,7 @@ func (config *configOptions) loadConfigFile() *configOptions {
 				errorLog.Fatalf("Config file contains undecoded keys: %q", ud)
 			}
 		}
+
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
 		}
@@ -2049,6 +2047,7 @@ func (config *configOptions) build() *configOptions {
 	config.loadConfigFile()
 	config.loadPlugins()
 	config.setDefaults()
+
 	return config
 }
 
@@ -2525,7 +2524,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 	if op.IsSourceDirect() {
 		return nil
 	}
-	if op.Timestamp.T == 0 {
+	if op.Timestamp == 0 {
 		return nil
 	}
 	client, config := ic.client, ic.config
@@ -2565,7 +2564,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 						if toJSON, err = json.Marshal(op.Data); err == nil {
 							if mergeDoc, err = jsonpatch.CreateMergePatch(fromJSON, toJSON); err == nil {
 								merge := make(map[string]interface{})
-								merge["ts"] = op.Timestamp.T
+								merge["ts"] = op.Timestamp
 								merge["p"] = string(mergeDoc)
 								merge["v"] = len(merges) + 1
 								merges = append(merges, merge)
@@ -2584,7 +2583,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 			if toJSON, err = json.Marshal(op.Data); err == nil {
 				merge := make(map[string]interface{})
 				merge["v"] = 1
-				merge["ts"] = op.Timestamp.T
+				merge["ts"] = op.Timestamp
 				merge["p"] = string(toJSON)
 				merges = append(merges, merge)
 				op.Data[config.MergePatchAttr] = merges
@@ -2697,7 +2696,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 			}
 			data["_source_id"] = objectID
 			if ic.config.IndexOplogTime == false {
-				secs := int64(op.Timestamp.T)
+				secs := op.Timestamp
 				t := time.Unix(secs, 0).UTC()
 				data[ic.config.OplogTsFieldName] = op.Timestamp
 				data[ic.config.OplogDateFieldName] = t.Format(ic.config.OplogDateFieldFormat)
@@ -3443,7 +3442,7 @@ func (ic *indexClient) doDelete(op *gtm.Op) {
 	objectID, indexType, meta := opIDToString(op), ic.mapIndex(op), &indexingMeta{}
 	req.Id(objectID)
 	if ic.config.IndexAsUpdate == false {
-		req.Version(tsVersion(op.Timestamp))
+		req.Version(op.Timestamp)
 		req.VersionType("external")
 	}
 	if ic.config.DeleteStrategy == statefulDeleteStrategy {
@@ -3825,19 +3824,16 @@ func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 	var after gtm.TimestampGenerator
 	config := ic.config
 	if config.Replay {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			return primitive.Timestamp{}, nil
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			return 0, nil
 		}
 	} else if config.ResumeFromTimestamp != 0 {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			return primitive.Timestamp{
-				T: uint32(config.ResumeFromTimestamp >> 32),
-				I: uint32(config.ResumeFromTimestamp),
-			}, nil
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			return config.ResumeFromTimestamp >> 32, nil
 		}
 	} else if config.Resume {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			var ts primitive.Timestamp
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			var ts int64
 			var err error
 			col := client.Database(config.ConfigDatabaseName).Collection("monstache")
 			result := col.FindOne(context.Background(), bson.M{
@@ -3847,12 +3843,11 @@ func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 				doc := make(map[string]interface{})
 				if err = result.Decode(&doc); err == nil {
 					if doc["ts"] != nil {
-						ts = doc["ts"].(primitive.Timestamp)
-						ts.I++
+						ts = doc["ts"].(int64)
 					}
 				}
 			}
-			if ts.T == 0 {
+			if ts == 0 {
 				ts, _ = gtm.LastOpTimestamp(client, options)
 			}
 			infoLog.Printf("Resuming from timestamp %+v", ts)
@@ -4002,6 +3997,7 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 	if config.dynamicDirectReadList() {
 		config.DirectReadNs = ic.buildDynamicDirectReadNs(nsFilter)
 	}
+
 	gtmOpts := &gtm.Options{
 		After:               after,
 		Filter:              filter,
@@ -4062,8 +4058,8 @@ func (ic *indexClient) clusterWait() {
 }
 
 func (ic *indexClient) nextTimestamp() {
-	if ic.lastTs.T > ic.lastTsSaved.T ||
-		(ic.lastTs.T == ic.lastTsSaved.T && ic.lastTs.I > ic.lastTsSaved.I) {
+	if ic.lastTs > ic.lastTsSaved ||
+		(ic.lastTs == ic.lastTsSaved) {
 		ic.bulk.Flush()
 		if err := ic.saveTimestamp(); err == nil {
 			ic.lastTsSaved = ic.lastTs
@@ -4299,15 +4295,8 @@ func getBuildInfo(client *mongo.Client) (bi *buildInfo, err error) {
 }
 
 func (ic *indexClient) saveTimestampFromReplStatus() {
-	if rs, err := gtm.GetReplStatus(ic.mongo); err == nil {
-		if ic.lastTs, err = rs.GetLastCommitted(); err == nil {
-			if err = ic.saveTimestamp(); err != nil {
-				ic.processErr(err)
-			}
-		} else {
-			ic.processErr(err)
-		}
-	} else {
+	ic.lastTs = time.Now().UTC().Unix()
+	if err := ic.saveTimestamp(); err != nil {
 		ic.processErr(err)
 	}
 }
