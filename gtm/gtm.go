@@ -775,9 +775,9 @@ retry:
 }
 
 func UpdateIsReplace(entry map[string]interface{}) bool {
-	if _, ok := entry["$set"]; ok {
+	if _, ok := entry["set"]; ok {
 		return false
-	} else if _, ok := entry["$unset"]; ok {
+	} else if _, ok := entry["unset"]; ok {
 		return false
 	} else {
 		return true
@@ -897,6 +897,8 @@ func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error
 					rawField = entry.Doc
 					if o.UpdateDataAsDelta || UpdateIsReplace(rawField) {
 						this.processData(rawField, o)
+					} else {
+						this.processData(this.parseOplogChange(rawField), o)
 					}
 				}
 				include = true
@@ -906,6 +908,15 @@ func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error
 		}
 	}
 	return
+}
+
+func (this *Op) parseOplogChange(m map[string]interface{}) interface{} {
+	if !UpdateIsReplace(m) {
+		if setmap, ok := m["set"]; ok {
+			return setmap
+		}
+	}
+	return nil
 }
 
 func OpLogCollection(client *mongo.Client, o *Options) *mongo.Collection {
