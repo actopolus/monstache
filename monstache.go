@@ -4058,8 +4058,7 @@ func (ic *indexClient) clusterWait() {
 }
 
 func (ic *indexClient) nextTimestamp() {
-	if ic.lastTs > ic.lastTsSaved ||
-		(ic.lastTs == ic.lastTsSaved) {
+	if ic.lastTs > ic.lastTsSaved {
 		ic.bulk.Flush()
 		if err := ic.saveTimestamp(); err == nil {
 			ic.lastTsSaved = ic.lastTs
