@@ -1571,7 +1571,6 @@ func (this *Options) SetDefaults() {
 	} else {
 		this.OpLogDisabled = true
 	}
-
 	if this.OpLogDatabaseName == "" {
 		this.OpLogDatabaseName = defaultOpts.OpLogDatabaseName
 	}
