@@ -20,14 +20,13 @@ type processor func(msg []byte) error
 
 // FDBStreamClient - FDBDoc change listener
 type FDBStreamClient struct {
-	address        []string
-	timeout        time.Duration
-	reconnectAfter time.Duration
-	conn           net.Conn
-	stop           chan struct{}
-	enabled        bool
-	logger         *log.Logger
-	mtx            sync.Mutex
+	address []string
+	timeout time.Duration
+	conn    net.Conn
+	stop    chan struct{}
+	enabled bool
+	logger  *log.Logger
+	mtx     sync.Mutex
 }
 
 // NewFDBStreamClient - create new fdb doc change stream listener
@@ -38,15 +37,8 @@ func NewFDBStreamClient(urls []string, timeout string, reconnectAfter string, lo
 		deadlineTimeout = time.Second * 120
 	}
 
-	reconnectDelay, err := time.ParseDuration(reconnectAfter)
-	if err != nil {
-		logger.Println("fdbStreamClient error: Unable to parse reconnect after duration")
-		reconnectDelay = time.Second * 3
-	}
-
-	client := FDBStreamClient{address: urls, timeout: deadlineTimeout, reconnectAfter: reconnectDelay, logger: logger}
+	client := FDBStreamClient{address: urls, timeout: deadlineTimeout, logger: logger}
 	client.stop = make(chan struct{})
-
 	return client
 }
 
@@ -75,22 +67,15 @@ func (f *FDBStreamClient) Listen(processor processor) error {
 	f.enabled = true
 	f.mtx.Unlock()
 
-	for {
-		if err := f.connect(); err == nil {
-			if err := f.receive(processor); err == ErrStopped {
-				return err
-			} else {
-				f.logger.Println("fdbStreamClient error (read):", err)
-			}
-		} else {
-			f.logger.Println("fdbStreamClient error (connection):", err)
-		}
-
-		if f.isStopSignal() {
-			return ErrStopped
-		}
-		time.Sleep(f.reconnectAfter)
+	if err := f.connect(); err != nil {
+		return err
 	}
+
+	if err := f.receive(processor); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // connect - establish connection with fdb change stream
@@ -122,6 +107,10 @@ func (f *FDBStreamClient) receive(processor processor) error {
 			return ErrStopped
 		}
 
+		if err := f.refresh(); err != nil {
+			return err
+		}
+
 		lnBytes, err := buf.ReadBytes('\n')
 		if err != nil {
 			return err
@@ -134,10 +123,6 @@ func (f *FDBStreamClient) receive(processor processor) error {
 		}
 
 		if err = processor(msgBytes); err != nil {
-			return err
-		}
-
-		if err = f.refresh(); err != nil {
 			return err
 		}
 	}
