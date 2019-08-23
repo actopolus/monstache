@@ -43,22 +43,18 @@ func NewFDBStreamClient(urls []string, timeout string, reconnectAfter string, lo
 }
 
 // Stop - stop listening
-func (f *FDBStreamClient) Stop() error {
+func (f *FDBStreamClient) Stop() bool {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
 
 	if !f.enabled {
-		return nil
+		return false
 	}
 
 	f.stop <- struct{}{}
 	f.enabled = false
 
-	if f.conn == nil {
-		return nil
-	}
-
-	return f.conn.Close()
+	return true
 }
 
 // Listen - listen and read connection
@@ -71,6 +67,7 @@ func (f *FDBStreamClient) Listen(processor processor) error {
 		return err
 	}
 
+	defer func() { _ = f.close() }()
 	if err := f.receive(processor); err != nil {
 		return err
 	}
@@ -96,6 +93,14 @@ func (f *FDBStreamClient) connect() (err error) {
 // refresh - refresh connection timeout
 func (f *FDBStreamClient) refresh() error {
 	return f.conn.SetDeadline(time.Now().Add(f.timeout))
+}
+
+// close - close connection
+func (f *FDBStreamClient) close() error {
+	if f.conn == nil {
+		return nil
+	}
+	return f.conn.Close()
 }
 
 // receive - receive data from connection
