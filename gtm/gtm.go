@@ -617,17 +617,6 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, o *Options, handler ShardInsertHa
 	}
 }
 
-func (ctx *OpCtxMulti) AddShardListener(
-	configSession *mongo.Client, shardOptions *Options, handler ShardInsertHandler) {
-	opts := DefaultOptions()
-	opts.NamespaceFilter = func(op *Op) bool {
-		return op.Namespace == "config.shards" && op.IsInsert()
-	}
-	configCtx := Start(configSession, opts)
-	ctx.allWg.Add(1)
-	go tailShards(ctx, configCtx, shardOptions, handler)
-}
-
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
 		for _, filter := range filters {
@@ -1580,36 +1569,6 @@ func (this *Options) SetDefaults() {
 	if this.MaxWaitSecs == 0 {
 		this.MaxWaitSecs = defaultOpts.MaxWaitSecs
 	}
-}
-
-func Tail(client *mongo.Client, o *Options) (OpChan, chan error) {
-	ctx := Start(client, o)
-	return ctx.OpC, ctx.ErrC
-}
-
-func GetShards(client *mongo.Client) (shardInfos []*ShardInfo) {
-	// use this for sharded databases to get the shard hosts
-	// use the hostnames to create multiple clients for a call to StartMulti
-	col := client.Database("config").Collection("shards")
-	opts := &options.FindOptions{}
-	cursor, err := col.Find(context.Background(), nil, opts)
-	if err != nil {
-		return
-	}
-	for cursor.Next(context.Background()) {
-		shard := map[string]interface{}{}
-		if err = cursor.Decode(&shard); err != nil {
-			continue
-		}
-		if shard["host"] == nil {
-			continue
-		}
-		shardInfo := &ShardInfo{
-			hostname: shard["host"].(string),
-		}
-		shardInfos = append(shardInfos, shardInfo)
-	}
-	return
 }
 
 func StartMulti(clients []*mongo.Client, o *Options) *OpCtxMulti {

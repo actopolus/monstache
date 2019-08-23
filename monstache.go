@@ -226,7 +226,6 @@ type configOptions struct {
 	EnableTemplate           bool
 	EnvDelimiter             string
 	MongoURL                 string      `toml:"mongo-url"`
-	MongoConfigURL           string      `toml:"mongo-config-url"`
 	MongoOpLogDatabaseName   string      `toml:"mongo-oplog-database-name"`
 	MongoOpLogCollectionName string      `toml:"mongo-oplog-collection-name"`
 	GtmSettings              gtmSettings `toml:"gtm-settings"`
@@ -367,10 +366,6 @@ func (args *stringargs) String() string {
 func (args *stringargs) Set(value string) error {
 	*args = append(*args, value)
 	return nil
-}
-
-func (config *configOptions) readShards() bool {
-	return len(config.ChangeStreamNs) == 0 && config.MongoConfigURL != ""
 }
 
 func (config *configOptions) dynamicDirectReadList() bool {
@@ -1372,7 +1367,6 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.EnableTemplate, "tpl", false, "True to interpret the config file as a template")
 	flag.StringVar(&config.EnvDelimiter, "env-delimiter", ",", "A delimiter to use when splitting environment variable values")
 	flag.StringVar(&config.MongoURL, "mongo-url", "", "MongoDB server or router server connection URL")
-	flag.StringVar(&config.MongoConfigURL, "mongo-config-url", "", "MongoDB config server connection URL")
 	flag.StringVar(&config.MongoOpLogDatabaseName, "mongo-oplog-database-name", "", "Override the database name which contains the mongodb oplog")
 	flag.StringVar(&config.MongoOpLogCollectionName, "mongo-oplog-collection-name", "", "Override the collection name which contains the mongodb oplog")
 	flag.StringVar(&config.GraylogAddr, "graylog-addr", "", "Send logs to a Graylog server at this address")
@@ -1732,9 +1726,6 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
 		}
-		if config.MongoConfigURL == "" {
-			config.MongoConfigURL = tomlConfig.MongoConfigURL
-		}
 		if config.MongoOpLogDatabaseName == "" {
 			config.MongoOpLogDatabaseName = tomlConfig.MongoOpLogDatabaseName
 		}
@@ -2071,11 +2062,6 @@ func (config *configOptions) loadEnvironment() *configOptions {
 				config.MongoURL = val
 			}
 			break
-		case "MONSTACHE_MONGO_CONFIG_URL":
-			if config.MongoConfigURL == "" {
-				config.MongoConfigURL = val
-			}
-			break
 		case "MONSTACHE_MONGO_OPLOG_DB":
 			if config.MongoOpLogDatabaseName == "" {
 				config.MongoOpLogDatabaseName = val
@@ -2230,9 +2216,6 @@ func (config *configOptions) loadGridFsConfig() *configOptions {
 func (config configOptions) dump() {
 	if config.MongoURL != "" {
 		config.MongoURL = cleanMongoURL(config.MongoURL)
-	}
-	if config.MongoConfigURL != "" {
-		config.MongoConfigURL = cleanMongoURL(config.MongoConfigURL)
 	}
 	if config.ElasticUser != "" {
 		config.ElasticUser = redact
@@ -3800,26 +3783,6 @@ func (ic *indexClient) startReadWait() {
 	}
 }
 
-func (ic *indexClient) dialShards() []*mongo.Client {
-	var mongos []*mongo.Client
-	// get the list of shard servers
-	shardInfos := gtm.GetShards(ic.mongoConfig)
-	if len(shardInfos) == 0 {
-		errorLog.Fatalln("Shards enabled but none found in config.shards collection")
-	}
-	// add each shard server to the sync list
-	for _, shardInfo := range shardInfos {
-		shardURL := shardInfo.GetURL()
-		infoLog.Printf("Adding shard found at %s\n", cleanMongoURL(shardURL))
-		shard, err := ic.config.dialMongo(shardURL)
-		if err != nil {
-			errorLog.Fatalf("Unable to connect to mongodb shard using URL %s: %s", cleanMongoURL(shardURL), err)
-		}
-		mongos = append(mongos, shard)
-	}
-	return mongos
-}
-
 func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 	var after gtm.TimestampGenerator
 	config := ic.config
@@ -3859,28 +3822,13 @@ func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 
 func (ic *indexClient) buildConnections() []*mongo.Client {
 	var mongos []*mongo.Client
-	var err error
-	config := ic.config
-	if config.readShards() {
-		// if we have a config server URL then we are running in a sharded cluster
-		ic.mongoConfig, err = config.dialMongo(config.MongoConfigURL)
-		if err != nil {
-			errorLog.Fatalf("Unable to connect to mongodb config server using URL %s: %s",
-				cleanMongoURL(config.MongoConfigURL), err)
-		}
-		mongos = ic.dialShards()
-	} else {
-		mongos = append(mongos, ic.mongo)
-	}
+	mongos = append(mongos, ic.mongo)
 	return mongos
 }
 
 func (ic *indexClient) buildFilterChain() []gtm.OpFilter {
 	config := ic.config
 	filterChain := []gtm.OpFilter{notMonstache(config), notSystem, notChunks}
-	if config.readShards() {
-		filterChain = append(filterChain, notConfig)
-	}
 	if config.NsRegex != "" {
 		filterChain = append(filterChain, filterWithRegex(config.NsRegex))
 	}
@@ -4023,12 +3971,8 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 }
 
 func (ic *indexClient) startListen() {
-	config := ic.config
 	gtmOpts := ic.buildGtmOptions()
 	ic.gtmCtx = gtm.StartMulti(ic.buildConnections(), gtmOpts)
-	if config.readShards() && !config.DisableChangeEvents {
-		ic.gtmCtx.AddShardListener(ic.mongoConfig, gtmOpts, config.makeShardInsertHandler())
-	}
 }
 
 func (ic *indexClient) clusterWait() {
