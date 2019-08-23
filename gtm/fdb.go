@@ -1,4 +1,4 @@
-package fdb
+package gtm
 
 import (
 	"bufio"
@@ -30,7 +30,7 @@ type FDBStreamClient struct {
 }
 
 // NewFDBStreamClient - create new fdb doc change stream listener
-func NewFDBStreamClient(urls []string, timeout string, reconnectAfter string, logger *log.Logger) FDBStreamClient {
+func NewFDBStreamClient(urls []string, timeout string, logger *log.Logger) FDBStreamClient {
 	deadlineTimeout, err := time.ParseDuration(timeout)
 	if err != nil {
 		logger.Println("fdbStreamClient error: unable to parse timeout duration")

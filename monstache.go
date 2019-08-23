@@ -108,6 +108,7 @@ type indexClient struct {
 	gtmCtx      *gtm.OpCtxMulti
 	config      *configOptions
 	mongo       *mongo.Client
+	fdbManager  *gtm.FDBStreamManager
 	mongoConfig *mongo.Client
 	bulk        *elastic.BulkProcessor
 	bulkStats   *elastic.BulkProcessor
@@ -240,6 +241,9 @@ type configOptions struct {
 	ElasticVersion           string      `toml:"elasticsearch-version"`
 	ElasticHealth0           int         `toml:"elasticsearch-healthcheck-timeout-startup"`
 	ElasticHealth1           int         `toml:"elasticsearch-healthcheck-timeout"`
+	FDBStreamUrls            []string    `toml:"fdb-stream-urls"`
+	FDBReconnectDelay        string      `toml:"fdb-reconnect-delay"`
+	FDBReadTimeout           string      `toml:"fdb-read-timeout"`
 	ResumeName               string      `toml:"resume-name"`
 	NsRegex                  string      `toml:"namespace-regex"`
 	NsDropRegex              string      `toml:"namespace-drop-regex"`
@@ -1725,6 +1729,15 @@ func (config *configOptions) loadConfigFile() *configOptions {
 
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
+		}
+		if config.FDBReadTimeout == "" {
+			config.FDBReadTimeout = tomlConfig.FDBReadTimeout
+		}
+		if config.FDBReconnectDelay == "" {
+			config.FDBReconnectDelay = tomlConfig.FDBReconnectDelay
+		}
+		if len(config.FDBStreamUrls) == 0 {
+			config.FDBStreamUrls = tomlConfig.FDBStreamUrls
 		}
 		if config.MongoOpLogDatabaseName == "" {
 			config.MongoOpLogDatabaseName = tomlConfig.MongoOpLogDatabaseName
@@ -3972,7 +3985,7 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 
 func (ic *indexClient) startListen() {
 	gtmOpts := ic.buildGtmOptions()
-	ic.gtmCtx = gtm.StartMulti(ic.buildConnections(), gtmOpts)
+	ic.gtmCtx = gtm.StartMulti(ic.buildConnections(), ic.fdbManager, gtmOpts)
 }
 
 func (ic *indexClient) clusterWait() {
@@ -4263,6 +4276,11 @@ func mustConfig() *configOptions {
 	return config
 }
 
+func buildFDBStream(config *configOptions) gtm.FDBStreamManager {
+	cl := gtm.NewFDBStreamClient(config.FDBStreamUrls, config.FDBReadTimeout, infoLog)
+	return gtm.NewFDBStreamManager(&cl, config.FDBReconnectDelay, infoLog)
+}
+
 func buildMongoClient(config *configOptions) *mongo.Client {
 	mongoClient, err := config.dialMongo(config.MongoURL)
 	if err != nil {
@@ -4302,6 +4320,7 @@ func main() {
 	config := mustConfig()
 
 	mongoClient := buildMongoClient(config)
+	fdbManager := buildFDBStream(config)
 	loadBuiltinFunctions(mongoClient, config)
 
 	elasticClient := buildElasticClient(config)
@@ -4322,6 +4341,7 @@ func main() {
 		processC:    make(chan *gtm.Op),
 		fileC:       make(chan *gtm.Op),
 		relateC:     make(chan *gtm.Op, config.RelateBuffer),
+		fdbManager:  &fdbManager,
 	}
 
 	ic.run()

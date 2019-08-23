@@ -519,104 +519,6 @@ func cursorTimeout(ec errchk) bool {
 	return false
 }
 
-func invalidCursor(ec errchk) bool {
-	err := unwrapErr(ec.Err())
-	if err != nil {
-		if ce, ok := err.(mongo.CommandError); ok {
-			code := ce.Code
-			if code == 43 { // cursor not found
-				return true
-			}
-			if code == 11601 { // cursor interrupted
-				return true
-			}
-			if code == 136 { // cursor capped position lost
-				return true
-			}
-			if code == 237 { // cursor killed
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func tailShards(multi *OpCtxMulti, ctx *OpCtx, o *Options, handler ShardInsertHandler) {
-	defer multi.allWg.Done()
-	if o == nil {
-		o = DefaultOptions()
-	} else {
-		o.SetDefaults()
-	}
-	for {
-		select {
-		case <-multi.stopC:
-			return
-		case <-multi.pauseC:
-			select {
-			case <-multi.stopC:
-				return
-			case <-multi.resumeC:
-				break
-			}
-		case err := <-ctx.ErrC:
-			if err == nil {
-				break
-			}
-			multi.ErrC <- err
-		case op := <-ctx.OpC:
-			if op == nil || op.Data == nil || op.Data["host"] == nil {
-				break
-			}
-			shardHost, ok := op.Data["host"].(string)
-			if !ok {
-				break
-			}
-			// new shard detected
-			multi.lock.Lock()
-			if multi.stopped {
-				multi.lock.Unlock()
-				break
-			}
-			shardInfo := &ShardInfo{
-				hostname: shardHost,
-			}
-			shardClient, err := handler(shardInfo)
-			if err != nil {
-				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
-				multi.lock.Unlock()
-				break
-			}
-			shardCtx := Start(shardClient, o)
-			multi.contexts = append(multi.contexts, shardCtx)
-			multi.DirectReadWg.Add(1)
-			multi.allWg.Add(1)
-			multi.opWg.Add(2)
-			go func() {
-				defer multi.DirectReadWg.Done()
-				shardCtx.DirectReadWg.Wait()
-			}()
-			go func() {
-				defer multi.allWg.Done()
-				shardCtx.allWg.Wait()
-			}()
-			go func(c OpChan) {
-				defer multi.opWg.Done()
-				for op := range c {
-					multi.OpC <- op
-				}
-			}(shardCtx.OpC)
-			go func(c chan error) {
-				defer multi.opWg.Done()
-				for err := range c {
-					multi.ErrC <- err
-				}
-			}(shardCtx.ErrC)
-			multi.lock.Unlock()
-		}
-	}
-}
-
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
 		for _, filter := range filters {
@@ -963,6 +865,67 @@ func opDataReady(op *Op, o *Options) (ready bool) {
 		}
 	}
 	return
+}
+
+func TailFDBOps(ctx *OpCtx, client *mongo.Client, fdb *FDBStreamManager, channels []OpChan, o *Options) error {
+	defer ctx.allWg.Done()
+	var cts int64
+
+	if o.After != nil {
+		cts, _ = o.After(client, o)
+	} else {
+		cts, _ = LastOpTimestamp(client, o)
+	}
+
+	task := newTask(ctx.stopC)
+	defer task.Done()
+	for task.ctx.Err() == nil {
+		msgs := fdb.Resume(client, o, cts)
+		for entry := range msgs {
+			op := &Op{
+				Id:        "",
+				Operation: "",
+				Namespace: "",
+				Data:      nil,
+				Timestamp: 0,
+				Source:    OplogQuerySource,
+			}
+			ok, err := op.ParseLogEntry(&entry, o)
+			if err == nil {
+				if ok && op.matchesFilter(o) {
+					if opDataReady(op, o) {
+						ctx.OpC <- op
+					} else {
+						// broadcast to fetch channels
+						for _, channel := range channels {
+							channel <- op
+						}
+					}
+				}
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error parsing the oplog document")
+			}
+			select {
+			case ts := <-ctx.seekC:
+				cts = ts
+				fdb.Stop()
+				break
+			case <-ctx.pauseC:
+				<-ctx.resumeC
+				select {
+				case ts := <-ctx.seekC:
+					cts = ts
+				default:
+				}
+				fdb.Stop()
+				break
+			default:
+				cts = op.Timestamp
+			}
+		}
+	}
+
+	return nil
 }
 
 func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) error {
@@ -1571,7 +1534,7 @@ func (this *Options) SetDefaults() {
 	}
 }
 
-func StartMulti(clients []*mongo.Client, o *Options) *OpCtxMulti {
+func StartMulti(clients []*mongo.Client, fdbManager *FDBStreamManager, o *Options) *OpCtxMulti {
 	if o == nil {
 		o = DefaultOptions()
 	} else {
@@ -1607,7 +1570,7 @@ func StartMulti(clients []*mongo.Client, o *Options) *OpCtxMulti {
 	defer ctxMulti.lock.Unlock()
 
 	for _, client := range clients {
-		ctx := Start(client, o)
+		ctx := Start(client, fdbManager, o)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
 		allWg.Add(1)
 		directReadWg.Add(1)
@@ -1636,7 +1599,7 @@ func StartMulti(clients []*mongo.Client, o *Options) *OpCtxMulti {
 	return ctxMulti
 }
 
-func Start(client *mongo.Client, o *Options) *OpCtx {
+func Start(client *mongo.Client, fdbManager *FDBStreamManager, o *Options) *OpCtx {
 	if o == nil {
 		o = DefaultOptions()
 	} else {
@@ -1707,7 +1670,7 @@ func Start(client *mongo.Client, o *Options) *OpCtx {
 
 	if o.OpLogDisabled == false {
 		allWg.Add(1)
-		go TailOps(ctx, client, inOps, o)
+		go TailFDBOps(ctx, client, fdbManager, inOps, o)
 	}
 
 	return ctx
