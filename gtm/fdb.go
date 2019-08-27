@@ -106,6 +106,7 @@ func (f *FDBStreamClient) close() error {
 // receive - receive data from connection
 func (f *FDBStreamClient) receive(processor processor) error {
 	buf := bufio.NewReader(f.conn)
+	szBytes := make([]byte, 8)
 
 	for {
 		if f.isStopSignal() {
@@ -116,18 +117,21 @@ func (f *FDBStreamClient) receive(processor processor) error {
 			return err
 		}
 
-		lnBytes, err := buf.ReadBytes('\n')
-		if err != nil {
+		if _, err := io.ReadFull(buf, szBytes); err != nil {
 			return err
 		}
 
-		msgSize := binary.LittleEndian.Uint64(lnBytes)
+		if _, err := buf.ReadByte(); err != nil {
+			return err
+		}
+
+		msgSize := binary.LittleEndian.Uint64(szBytes)
 		msgBytes := make([]byte, msgSize)
-		if _, err = io.ReadFull(buf, msgBytes); err != nil {
+		if _, err := io.ReadFull(buf, msgBytes); err != nil {
 			return err
 		}
 
-		if err = processor(msgBytes); err != nil {
+		if err := processor(msgBytes); err != nil {
 			return err
 		}
 	}

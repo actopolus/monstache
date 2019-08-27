@@ -43,8 +43,6 @@ func (f *FDBStreamManager) getOplogCursor(
 	opts := &options.FindOptions{}
 	opts.SetSort(bson.M{"$natural": 1})
 	opts.SetCursorType(options.TailableAwait)
-	//opts.SetOplogReplay(true)
-	//opts.SetNoCursorTimeout(true)
 	collection := OpLogCollection(client, o)
 	return collection.Find(context.Background(), query, opts)
 }
