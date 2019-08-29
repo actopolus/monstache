@@ -14,9 +14,7 @@ import (
 // FDBStreamManager - manager for stream listener
 type FDBStreamManager struct {
 	client         *FDBStreamClient
-	oplog          chan OpLog
 	logger         *log.Logger
-	fdMtx          sync.RWMutex
 	reconnectAfter time.Duration
 }
 
@@ -28,7 +26,7 @@ func NewFDBStreamManager(client *FDBStreamClient, reconnectAfter string, logger 
 		reconnectDuration = time.Second * 3
 	}
 
-	return FDBStreamManager{client: client, oplog: make(chan OpLog), logger: logger, reconnectAfter: reconnectDuration}
+	return FDBStreamManager{client: client, logger: logger, reconnectAfter: reconnectDuration}
 }
 
 func (f *FDBStreamManager) getOplogCursor(
@@ -36,7 +34,7 @@ func (f *FDBStreamManager) getOplogCursor(
 	after, before int64,
 	o *Options) (*mongo.Cursor, error) {
 	query := bson.M{
-		"ts":          bson.M{"$gt": after, "$lt": before},
+		"ts":          bson.M{"$gt": after, "$lte": before},
 		"op":          bson.M{"$in": opCodes},
 		"fromMigrate": bson.M{"$exists": false},
 	}
@@ -49,16 +47,67 @@ func (f *FDBStreamManager) getOplogCursor(
 
 // Stop - stop event loop
 func (f *FDBStreamManager) Stop() {
-	f.Stop()
+	f.client.Stop()
+}
+
+func (f *FDBStreamManager) fetchOplog(
+	ctx context.Context,
+	client *mongo.Client,
+	options *Options,
+	tsFrom, tsTo int64,
+	output chan OpLog,
+) error {
+	f.logger.Println("fdbStreamManager: resumed from:", tsFrom)
+	f.logger.Println("fdbStreamManager: resumed to:", tsTo)
+
+OuterLoop:
+	for {
+		next := false
+		cursor, err := f.getOplogCursor(client, tsFrom, tsTo, options)
+		if err != nil {
+			return err
+		}
+
+	InnerLoop:
+		for cursor.Next(ctx) {
+			var entry OpLog
+			if err = cursor.Decode(&entry); err != nil {
+				next = true
+				break InnerLoop
+			}
+			output <- entry
+		}
+		if err = cursor.Close(context.Background()); err != nil {
+			return err
+		}
+
+		if !next {
+			break OuterLoop
+		}
+	}
+
+	return nil
 }
 
 // Resume - resume from timestamp
-func (f *FDBStreamManager) Resume(client *mongo.Client, options *Options, ts int64) chan OpLog {
-	f.oplog = make(chan OpLog)
+func (f *FDBStreamManager) Resume(ctx context.Context, client *mongo.Client, options *Options, ts int64) chan OpLog {
+	oplog := make(chan OpLog)
 	bufferCh := make(chan OpLog)
-	startCh := make(chan struct{})
-	tsUntilCh := make(chan int64)
 	firstDoc := true
+	var fdMtx sync.RWMutex
+
+	fnSetFirstDoc := func(isFirst bool) {
+		fdMtx.Lock()
+		firstDoc = isFirst
+		fdMtx.Unlock()
+	}
+
+	fnIsFirstDoc := func() bool {
+		fdMtx.RLock()
+		defer fdMtx.RUnlock()
+
+		return firstDoc
+	}
 
 	fnProcessor := func(msg []byte) error {
 		docReader := bsonrw.NewBSONDocumentReader(msg)
@@ -77,73 +126,28 @@ func (f *FDBStreamManager) Resume(client *mongo.Client, options *Options, ts int
 		return nil
 	}
 
-	fnFetchOplog := func() {
-		for tsUntil := range tsUntilCh {
-			f.logger.Println("fdbStreamManager: resumed from:", ts)
-			f.logger.Println("fdbStreamManager: resumed to:", tsUntil)
-
-			for {
-				next := false
-				cursor, err := f.getOplogCursor(client, ts, tsUntil, options)
-				if err != nil {
-					f.logger.Println("fdbStreamManager (fetch oplog):", err)
-					continue
-				}
-
-				for cursor.Next(context.Background()) {
-					var entry OpLog
-					if err = cursor.Decode(&entry); err != nil {
-						next = true
-						break
-					}
-					f.oplog <- entry
-				}
-
-				if next {
-					continue
-				}
-
-				startCh <- struct{}{}
-				break
-			}
-		}
-	}
-
 	fnListenBuffered := func() {
 		for msg := range bufferCh {
-			f.fdMtx.RLock()
-			if firstDoc {
-				f.fdMtx.RUnlock()
-
-				f.fdMtx.Lock()
-				firstDoc = false
-				f.fdMtx.Unlock()
-
-				tsUntilCh <- msg.Timestamp
-				<-startCh
-			} else {
-				f.fdMtx.RUnlock()
+			if fnIsFirstDoc() {
+				fnSetFirstDoc(false)
+				if err := f.fetchOplog(ctx, client, options, ts, msg.Timestamp, oplog); err != nil {
+					f.logger.Println("fdbStreamManager (fetching ops error):", err)
+				}
 			}
-
 			ts = msg.Timestamp
-			f.oplog <- msg
+			oplog <- msg
 		}
+		close(oplog)
 	}
 
 	fnListenChanges := func() {
 		for {
-			f.fdMtx.Lock()
-			firstDoc = true
-			f.fdMtx.Unlock()
-
+			fnSetFirstDoc(true)
 			if err := f.client.Listen(fnProcessor); err != nil {
 				f.logger.Println("fdbStreamManager (resume error):", err)
 
 				if err == ErrStopped {
-					close(tsUntilCh)
-					close(startCh)
 					close(bufferCh)
-					close(f.oplog)
 					return
 				}
 			}
@@ -153,7 +157,6 @@ func (f *FDBStreamManager) Resume(client *mongo.Client, options *Options, ts int
 
 	go fnListenChanges()
 	go fnListenBuffered()
-	go fnFetchOplog()
 
-	return f.oplog
+	return oplog
 }

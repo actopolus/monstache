@@ -624,8 +624,13 @@ func (this *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, o *Options) {
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
 		if op.IsUpdate() && op.Doc == nil {
-			idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
-			ns[op.Namespace] = append(ns[op.Namespace], op.Id)
+			oId, err := primitive.ObjectIDFromHex(op.Id.(string))
+			if err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error convert Id to ObjectId")
+				continue
+			}
+			ns[op.Namespace] = append(ns[op.Namespace], oId)
+			idKey := fmt.Sprintf("%s.%v", op.Namespace, oId)
 			byId[idKey] = append(byId[idKey], op)
 		}
 	}
@@ -788,9 +793,9 @@ func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error
 					rawField = entry.Doc
 					if o.UpdateDataAsDelta || UpdateIsReplace(rawField) {
 						this.processData(rawField, o)
-					} else {
+					} /* else {
 						this.processData(this.parseOplogChange(rawField), o)
-					}
+					}*/
 				}
 				include = true
 			} else if this.IsCommand() {
@@ -880,16 +885,24 @@ func TailFDBOps(ctx *OpCtx, client *mongo.Client, fdb *FDBStreamManager, channel
 	task := newTask(ctx.stopC)
 	defer task.Done()
 	for task.ctx.Err() == nil {
-		msgs := fdb.Resume(client, o, cts)
-		for entry := range msgs {
-			op := &Op{
-				Id:        "",
-				Operation: "",
-				Namespace: "",
-				Data:      nil,
-				Timestamp: 0,
-				Source:    OplogQuerySource,
+		msgs := fdb.Resume(task.ctx, client, o, cts)
+	MsgStream:
+		for {
+			var (
+				entry OpLog
+				ok    bool
+			)
+
+			select {
+			case entry, ok = <-msgs:
+				if !ok {
+					break MsgStream
+				}
+			case <-task.ctx.Done():
+				fdb.Stop()
+				break MsgStream
 			}
+			op := &Op{Id: "", Operation: "", Namespace: "", Data: nil, Timestamp: 0, Source: OplogQuerySource}
 			ok, err := op.ParseLogEntry(&entry, o)
 			if err == nil {
 				if ok && op.matchesFilter(o) {
@@ -909,16 +922,16 @@ func TailFDBOps(ctx *OpCtx, client *mongo.Client, fdb *FDBStreamManager, channel
 			case ts := <-ctx.seekC:
 				cts = ts
 				fdb.Stop()
-				break
+				break MsgStream
 			case <-ctx.pauseC:
+				fdb.Stop()
 				<-ctx.resumeC
 				select {
 				case ts := <-ctx.seekC:
 					cts = ts
 				default:
 				}
-				fdb.Stop()
-				break
+				break MsgStream
 			default:
 				cts = op.Timestamp
 			}
@@ -1657,20 +1670,23 @@ func Start(client *mongo.Client, fdbManager *FDBStreamManager, o *Options) *OpCt
 		}
 	}
 
+	for _, ns := range o.ChangeStreamNs {
+		allWg.Add(1)
+		go ConsumeChangeStream(ctx, client, ns, o)
+	}
+
 	if len(o.DirectReadNs) > 0 {
 		directReadWg.Add(1)
 		allWg.Add(1)
 		go ProcessDirectReads(ctx, client, o)
 	}
 
-	for _, ns := range o.ChangeStreamNs {
-		allWg.Add(1)
-		go ConsumeChangeStream(ctx, client, ns, o)
-	}
-
 	if o.OpLogDisabled == false {
 		allWg.Add(1)
-		go TailFDBOps(ctx, client, fdbManager, inOps, o)
+		go func() {
+			directReadWg.Wait()
+			go TailFDBOps(ctx, client, fdbManager, inOps, o)
+		}()
 	}
 
 	return ctx

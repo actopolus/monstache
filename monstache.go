@@ -89,6 +89,7 @@ const postProcessorsDefault = 10
 const redact = "REDACTED"
 const configDatabaseNameDefault = "monstache"
 const relateQueueOverloadMsg = "Relate queue is full. Skipping relate for %v.(%v) to keep pipeline healthy."
+const timestampMultiplier = 1000
 
 type deleteStrategy int
 
@@ -4251,7 +4252,7 @@ func getBuildInfo(client *mongo.Client) (bi *buildInfo, err error) {
 }
 
 func (ic *indexClient) saveTimestampFromReplStatus() {
-	ic.lastTs = time.Now().UTC().Unix()
+	ic.lastTs = time.Now().UTC().Unix() * timestampMultiplier
 	if err := ic.saveTimestamp(); err != nil {
 		ic.processErr(err)
 	}
