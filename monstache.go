@@ -245,6 +245,7 @@ type configOptions struct {
 	FDBStreamUrls            []string    `toml:"fdb-stream-urls"`
 	FDBReconnectDelay        string      `toml:"fdb-reconnect-delay"`
 	FDBReadTimeout           string      `toml:"fdb-read-timeout"`
+	FDBFetchDocs             bool        `toml:"fdb-fetch-docs"`
 	ResumeName               string      `toml:"resume-name"`
 	NsRegex                  string      `toml:"namespace-regex"`
 	NsDropRegex              string      `toml:"namespace-drop-regex"`
@@ -1390,6 +1391,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.IntVar(&config.ElasticMaxBytes, "elasticsearch-max-bytes", 0, "Number of bytes to hold before flushing to Elasticsearch")
 	flag.IntVar(&config.ElasticMaxSeconds, "elasticsearch-max-seconds", 0, "Number of seconds before flushing to Elasticsearch")
 	flag.IntVar(&config.ElasticClientTimeout, "elasticsearch-client-timeout", 0, "Number of seconds before a request to Elasticsearch is timed out")
+	flag.BoolVar(&config.FDBFetchDocs, "fdb-fetch-docs", false, "True to enable fetching updated docs from mongo for fdb")
 	flag.Int64Var(&config.MaxFileSize, "max-file-size", 0, "GridFs file content exceeding this limit in bytes will not be indexed in Elasticsearch")
 	flag.StringVar(&config.ConfigFile, "f", "", "Location of configuration file")
 	flag.BoolVar(&config.DroppedDatabases, "dropped-databases", true, "True to delete indexes from dropped databases")
@@ -1823,6 +1825,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		}
 		if config.DroppedCollections && !tomlConfig.DroppedCollections {
 			config.DroppedCollections = false
+		}
+		if !config.FDBFetchDocs && tomlConfig.FDBFetchDocs {
+			config.FDBFetchDocs = true
 		}
 		if !config.Gzip && tomlConfig.Gzip {
 			config.Gzip = true
@@ -3980,6 +3985,7 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 		Log:                 infoLog,
 		Pipe:                buildPipe(config),
 		ChangeStreamNs:      config.ChangeStreamNs,
+		FetchDocs:           config.FDBFetchDocs,
 	}
 	return gtmOpts
 }

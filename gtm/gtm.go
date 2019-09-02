@@ -98,6 +98,7 @@ type Options struct {
 	Pipe                PipelineBuilder
 	PipeAllowDisk       bool
 	Log                 *log.Logger
+	FetchDocs           bool
 }
 
 type Op struct {
@@ -793,9 +794,9 @@ func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error
 					rawField = entry.Doc
 					if o.UpdateDataAsDelta || UpdateIsReplace(rawField) {
 						this.processData(rawField, o)
-					} /* else {
+					} else if !o.FetchDocs {
 						this.processData(this.parseOplogChange(rawField), o)
-					}*/
+					}
 				}
 				include = true
 			} else if this.IsCommand() {
@@ -1484,6 +1485,7 @@ func DefaultOptions() *Options {
 		DirectReadNoTimeout: false,
 		Unmarshal:           nil,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
+		FetchDocs:           false,
 	}
 }
 
