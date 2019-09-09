@@ -90,6 +90,7 @@ const redact = "REDACTED"
 const configDatabaseNameDefault = "monstache"
 const relateQueueOverloadMsg = "Relate queue is full. Skipping relate for %v.(%v) to keep pipeline healthy."
 const timestampMultiplier = 1000
+const clusterNodeTTL = int32(30) // ttl for node in seconds
 
 type deleteStrategy int
 
@@ -1231,7 +1232,7 @@ func (ic *indexClient) ensureClusterTTL() error {
 	io := options.Index()
 	io.SetName("expireAt")
 	io.SetBackground(true)
-	io.SetExpireAfterSeconds(30)
+	io.SetExpireAfterSeconds(clusterNodeTTL)
 	im := mongo.IndexModel{
 		Keys:    bson.M{"expireAt": 1},
 		Options: io,
@@ -1242,53 +1243,46 @@ func (ic *indexClient) ensureClusterTTL() error {
 	return err
 }
 
-func (ic *indexClient) enableProcess() (bool, error) {
-	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("cluster")
-	doc := bson.M{}
-	doc["_id"] = ic.config.ResumeName
-	doc["expireAt"] = time.Now().UTC()
-	doc["pid"] = os.Getpid()
-	if host, err := os.Hostname(); err == nil {
-		doc["host"] = host
-	} else {
-		return false, err
-	}
-	_, err := col.InsertOne(context.Background(), doc)
-	if err == nil {
-		return true, nil
-	}
-	if isDup(err) {
+// ensureClusterExpiration - check cluster expiration
+func (ic *indexClient) ensureClusterExpiration(
+	col *mongo.Collection,
+	resume string,
+	pid int,
+	host string,
+	expired time.Time) (bool, error) {
+	doc := bson.M{"_id": resume, "expireAt": time.Now().UTC(), "pid": pid, "host": host}
+	filter := bson.M{"_id": resume, "expireAt": bson.M{"$lte": expired}}
+
+	opts := options.FindOneAndReplace().SetUpsert(true).SetReturnDocument(options.After)
+	result := col.FindOneAndReplace(context.Background(), filter, doc, opts)
+
+	afterDoc := make(map[string]interface{})
+	if err := result.Decode(&afterDoc); err != nil {
 		return false, nil
 	}
-	return false, err
+
+	aPid := afterDoc["pid"].(int32)
+	aHost := afterDoc["host"].(string)
+
+	if int(aPid) == pid && aHost == host {
+		return true, nil
+	}
+
+	return false, nil
 }
 
-func isDup(err error) bool {
-	checkCodeAndMessage := func(code int, message string) bool {
-		return code == 11000 ||
-			code == 11001 ||
-			code == 12582 ||
-			strings.Contains(message, "E11000")
+func (ic *indexClient) enableProcess() (bool, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		return false, err
 	}
-	if we, ok := err.(mongo.WriteException); ok {
-		if we.WriteConcernError != nil {
-			wce := we.WriteConcernError
-			code, message := wce.Code, wce.Message
-			if checkCodeAndMessage(code, message) {
-				return true
-			}
-		}
-		if we.WriteErrors != nil {
-			we := we.WriteErrors
-			for _, e := range we {
-				code, message := e.Code, e.Message
-				if checkCodeAndMessage(code, message) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+
+	return ic.ensureClusterExpiration(
+		ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("cluster"),
+		ic.config.ResumeName,
+		os.Getpid(),
+		host,
+		time.Now().Add(-time.Second*time.Duration(clusterNodeTTL)).UTC())
 }
 
 func (ic *indexClient) resetClusterState() error {
