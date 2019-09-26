@@ -835,31 +835,6 @@ func LastOpTimestamp(client *mongo.Client, o *Options) (int64, error) {
 	return opLog.Timestamp, err
 }
 
-func FirstOpTimestamp(client *mongo.Client, o *Options) (int64, error) {
-	opLog := OpLog{}
-	filter := validOps()
-	opts := &options.FindOneOptions{}
-	opts.SetSort(bson.M{"$natural": 1})
-	c := OpLogCollection(client, o)
-	err := c.FindOne(context.Background(), filter, opts).Decode(&opLog)
-	return opLog.Timestamp, err
-}
-
-func GetOpLogCursor(client *mongo.Client, after int64, o *Options) (*mongo.Cursor, error) {
-	query := bson.M{
-		"ts":          bson.M{"$gt": after},
-		"op":          bson.M{"$in": opCodes},
-		"fromMigrate": bson.M{"$exists": false},
-	}
-	opts := &options.FindOptions{}
-	opts.SetSort(bson.M{"$natural": 1})
-	opts.SetCursorType(options.TailableAwait)
-	//opts.SetOplogReplay(true)
-	//opts.SetNoCursorTimeout(true)
-	collection := OpLogCollection(client, o)
-	return collection.Find(context.Background(), query, opts)
-}
-
 func opDataReady(op *Op, o *Options) (ready bool) {
 	if o.UpdateDataAsDelta {
 		ready = true
@@ -942,81 +917,7 @@ func TailFDBOps(ctx *OpCtx, client *mongo.Client, fdb *FDBStreamManager, channel
 	return nil
 }
 
-func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) error {
-	defer ctx.allWg.Done()
-	var cursor *mongo.Cursor
-	var err error
-	var cts int64
-	if o.After != nil {
-		cts, _ = o.After(client, o)
-	} else {
-		cts, _ = LastOpTimestamp(client, o)
-	}
-	task := newTask(ctx.stopC)
-	defer task.Done()
-	for task.ctx.Err() == nil {
-		cursor, err = GetOpLogCursor(client, cts, o)
-		if err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error establishing the oplog cursor")
-			continue
-		}
-		next := true
-		for next && cursor.Next(task.ctx) {
-			var entry OpLog
-			if err = cursor.Decode(&entry); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error decoding the oplog document")
-				break
-			}
-			op := &Op{
-				Id:        "",
-				Operation: "",
-				Namespace: "",
-				Data:      nil,
-				Timestamp: 0,
-				Source:    OplogQuerySource,
-			}
-			ok, err := op.ParseLogEntry(&entry, o)
-			if err == nil {
-				if ok && op.matchesFilter(o) {
-					if opDataReady(op, o) {
-						ctx.OpC <- op
-					} else {
-						// broadcast to fetch channels
-						for _, channel := range channels {
-							channel <- op
-						}
-					}
-				}
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error parsing the oplog document")
-			}
-			select {
-			case ts := <-ctx.seekC:
-				cts = ts
-				next = false
-			case <-ctx.pauseC:
-				cursor.Close(context.Background())
-				next = false
-				<-ctx.resumeC
-				select {
-				case ts := <-ctx.seekC:
-					cts = ts
-				default:
-					break
-				}
-			default:
-				cts = op.Timestamp
-			}
-		}
-		if positionLost(cursor) {
-			cts, _ = FirstOpTimestamp(client, o)
-		}
-		cursor.Close(context.Background())
-	}
-	return nil
-}
-
-func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, seg *CollectionSegment, stats *CollectionStats) (err error) {
+func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, seg *CollectionSegment) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	defer ctx.directReadConcWg.Done()
@@ -1027,60 +928,20 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var batch int32 = 500
-	if stats.AvgObjectSize != 0 {
-		batch = (2 * 1024 * 1024) / stats.AvgObjectSize // 2MB divided by avg doc size
-		if batch < 500 {
-			batch = 500
-		}
-	}
+
 	c := client.Database(n.database).Collection(n.collection)
 	sel := seg.toSelector()
-	var cursor *mongo.Cursor
-	if o.Pipe != nil {
-		var pipeline []interface{}
-		if pipeline, err = o.Pipe(ns, false); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
-			return
-		}
-		if pipeline != nil && len(pipeline) > 0 {
-			var stages []interface{}
-			stages = append(stages, bson.M{"$match": sel})
-			for _, stage := range pipeline {
-				stages = append(stages, stage)
-			}
-			opts := options.Aggregate()
-			if batch != 0 {
-				opts.SetBatchSize(batch)
-			}
-			if o.PipeAllowDisk {
-				opts.SetAllowDiskUse(true)
-			}
-			cursor, err = c.Aggregate(task.ctx, stages, opts)
-		} else {
-			opts := options.Find()
-			if o.DirectReadNoTimeout {
-				opts.SetNoCursorTimeout(true)
-			}
-			if batch != 0 {
-				opts.SetBatchSize(batch)
-			}
-			cursor, err = c.Find(task.ctx, sel, opts)
-		}
-	} else {
-		opts := options.Find()
-		if o.DirectReadNoTimeout {
-			opts.SetNoCursorTimeout(true)
-		}
-		if batch != 0 {
-			opts.SetBatchSize(batch)
-		}
-		cursor, err = c.Find(task.ctx, sel, opts)
-	}
+
+	opts := options.Find()
+	opts.SetBatchSize(500)
+	opts.SetNoCursorTimeout(true)
+
+	cursor, err := c.Find(task.ctx, sel, opts)
 	if err != nil {
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error performing direct read of collection %s", ns))
 		return
 	}
+
 	result := map[string]interface{}{}
 	for cursor.Next(task.ctx) {
 		if err = cursor.Decode(&result); err != nil {
@@ -1105,32 +966,8 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 	if err = cursor.Err(); err != nil {
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error performing direct read of collection %s", ns))
 	}
-	cursor.Close(context.Background())
-	return
-}
 
-func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *CollectionStats, err error) {
-	stats = &CollectionStats{}
-	n := &N{}
-	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error reading collection stats. Invalid namespace.")
-		return
-	}
-	var result *mongo.SingleResult
-	cmd := bson.M{"collStats": n.collection}
-	result = client.Database(n.database).RunCommand(context.Background(), cmd)
-	err = result.Err()
-	if err == nil {
-		err = result.Decode(stats)
-	}
-	if stats.Count == 0 {
-		var count int64
-		col := client.Database(n.database).Collection(n.collection)
-		count, err = col.EstimatedDocumentCount(context.Background())
-		if err == nil {
-			stats.Count = int32(count)
-		}
-	}
+	cursor.Close(context.Background())
 	return
 }
 
@@ -1153,148 +990,6 @@ func ProcessDirectReads(ctx *OpCtx, client *mongo.Client, o *Options) (err error
 	return
 }
 
-func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (err error) {
-	defer ctx.allWg.Done()
-	n := &N{}
-	n.parseForChanges(ns)
-	ctx.log.Printf("Watching changes on %s", n.desc())
-	var pipeline []interface{}
-	var startAt *int64
-	var resumeAfter interface{}
-	if o.After != nil {
-		if pos, err := o.After(client, o); err == nil {
-			if pos > 0 {
-				startAt = &pos
-			} else if pos == 0 {
-				if pos, err = FirstOpTimestamp(client, o); err == nil {
-					startAt = &pos
-				}
-			}
-		}
-	}
-	if o.Pipe != nil {
-		var stages []interface{}
-		if stages, err = o.Pipe(ns, true); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
-			return
-		}
-		if stages != nil && len(stages) > 0 {
-			pipeline = stages
-		}
-	}
-	task := newTask(ctx.stopC)
-	defer task.Done()
-	for task.ctx.Err() == nil {
-		var stream *mongo.ChangeStream
-		opts := options.ChangeStream()
-		opts.SetBatchSize(int32(o.ChannelSize))
-		opts.SetFullDocument(options.UpdateLookup)
-		opts.SetStartAtOperationTime(&primitive.Timestamp{T: uint32((*startAt)), I: 0})
-		opts.SetResumeAfter(resumeAfter)
-		if n.isDeployment() {
-			stream, err = client.Watch(task.ctx, pipeline, opts)
-		} else if n.isDatabase() {
-			d := client.Database(n.database)
-			stream, err = d.Watch(task.ctx, pipeline, opts)
-		} else {
-			c := client.Database(n.database).Collection(n.collection)
-			stream, err = c.Watch(task.ctx, pipeline, opts)
-		}
-		if err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
-			if stream != nil {
-				stream.Close(context.Background())
-			}
-			continue
-		}
-		next := true
-		for next && stream.Next(task.ctx) {
-			var changeDoc ChangeDoc
-			if err = stream.Decode(&changeDoc); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc.")
-				break
-			}
-			resumeAfter = changeDoc.Id
-			startAt = nil
-			oper := changeDoc.mapOperation()
-			if changeDoc.isDrop() {
-				op := &Op{
-					Operation: oper,
-					Namespace: changeDoc.mapNs(),
-					Source:    OplogQuerySource,
-					Timestamp: changeDoc.mapTimestamp(),
-				}
-				op.Data = map[string]interface{}{"drop": changeDoc.Namespace.Collection}
-				if op.matchesNsFilter(o) {
-					ctx.OpC <- op
-				}
-			} else if changeDoc.isDropDatabase() {
-				op := &Op{
-					Operation: oper,
-					Namespace: changeDoc.mapNs(),
-					Source:    OplogQuerySource,
-					Timestamp: changeDoc.mapTimestamp(),
-				}
-				op.Data = map[string]interface{}{"dropDatabase": changeDoc.Namespace.Database}
-				if op.matchesNsFilter(o) {
-					ctx.OpC <- op
-				}
-			} else if changeDoc.isInvalidate() {
-				resumeAfter = nil
-				startAt = nil
-				next = false
-				time.Sleep(time.Duration(5) * time.Second)
-			} else if oper != "" {
-				op := &Op{
-					Id:        changeDoc.docId(),
-					Operation: oper,
-					Namespace: changeDoc.mapNs(),
-					Source:    OplogQuerySource,
-					Timestamp: changeDoc.mapTimestamp(),
-				}
-				if op.matchesNsFilter(o) {
-					if changeDoc.hasUpdate() {
-						op.UpdateDescription = changeDoc.UpdateDescription
-					}
-					if changeDoc.hasDoc() {
-						op.processData(changeDoc.FullDoc, o)
-						if op.matchesDirectFilter(o) {
-							ctx.OpC <- op
-						}
-					} else if op.matchesDirectFilter(o) {
-						ctx.OpC <- op
-					}
-				}
-			}
-			select {
-			case ts := <-ctx.seekC:
-				resumeAfter = nil
-				startAt = &ts
-				next = false
-			case <-ctx.pauseC:
-				stream.Close(context.Background())
-				next = false
-				<-ctx.resumeC
-				select {
-				case ts := <-ctx.seekC:
-					resumeAfter = nil
-					startAt = &ts
-				default:
-					break
-				}
-			default:
-				break
-			}
-		}
-		if positionLost(stream) {
-			resumeAfter = nil
-			startAt = nil
-		}
-		stream.Close(context.Background())
-	}
-	return nil
-}
-
 func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
@@ -1304,96 +999,11 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var stats *CollectionStats
-	stats, _ = GetCollectionStats(ctx, client, ns)
-	c := client.Database(n.database).Collection(n.collection)
-	var maxSplits int32 = o.DirectReadSplitMax
-	segment := &CollectionSegment{
-		splitKey: "_id",
-	}
-	if maxSplits <= 0 {
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		ctx.directReadConcWg.Add(1)
-		go DirectReadSegment(ctx, client, ns, o, segment, stats)
-		return
-	}
-	const defaultSegmentSize = 50000
-	const minSegmentSize = 5000
-	var segmentSize int32 = defaultSegmentSize
-
-	if stats.Count != 0 {
-		segmentSize = stats.Count / (maxSplits + 1)
-		if segmentSize < minSegmentSize {
-			ctx.allWg.Add(1)
-			ctx.DirectReadWg.Add(1)
-			ctx.directReadConcWg.Add(1)
-			go DirectReadSegment(ctx, client, ns, o, segment, stats)
-			return
-		}
-	}
-	var splitCount int32
-
-	done := false
-
-	task := newTask(ctx.stopC)
-	defer task.Done()
-
-	for !done {
-
-		sel := bson.M{}
-
-		if segment.min != nil {
-			sel["_id"] = bson.M{"$gte": segment.min}
-		}
-
-		stages := []bson.M{
-			{"$match": sel},
-			{"$sort": bson.M{"_id": 1}},
-			{"$skip": segmentSize},
-			{"$limit": 1},
-			{"$project": bson.M{"_id": 1}},
-		}
-
-		opts := options.Aggregate()
-		opts.SetAllowDiskUse(o.PipeAllowDisk)
-
-		hasMax := false
-		var cursor *mongo.Cursor
-		cursor, err = c.Aggregate(task.ctx, stages, opts)
-		if err == nil {
-			if cursor.Next(task.ctx) {
-				var doc Doc
-				cursor.Decode(&doc)
-				if doc.Id != nil {
-					segment.max = doc.Id
-					hasMax = true
-				}
-			}
-			cursor.Close(task.ctx)
-		}
-		done = !hasMax
-
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		ctx.directReadConcWg.Add(1)
-		go DirectReadSegment(ctx, client, ns, o, segment, stats)
-
-		if !done {
-			segment = &CollectionSegment{
-				splitKey: "_id",
-				min:      segment.max,
-			}
-			splitCount = splitCount + 1
-			if splitCount == maxSplits {
-				done = true
-				ctx.allWg.Add(1)
-				ctx.DirectReadWg.Add(1)
-				ctx.directReadConcWg.Add(1)
-				go DirectReadSegment(ctx, client, ns, o, segment, stats)
-			}
-		}
-	}
+	segment := &CollectionSegment{splitKey: "_id"}
+	ctx.allWg.Add(1)
+	ctx.DirectReadWg.Add(1)
+	ctx.directReadConcWg.Add(1)
+	go DirectReadSegment(ctx, client, ns, o, segment)
 	return
 }
 
@@ -1670,11 +1280,6 @@ func Start(client *mongo.Client, fdbManager *FDBStreamManager, o *Options) *OpCt
 			filter := OpFilterForOrdering(o.Ordering, workerNames, worker)
 			go FetchDocuments(ctx, client, filter, buf, inOp, o)
 		}
-	}
-
-	for _, ns := range o.ChangeStreamNs {
-		allWg.Add(1)
-		go ConsumeChangeStream(ctx, client, ns, o)
 	}
 
 	if len(o.DirectReadNs) > 0 {
