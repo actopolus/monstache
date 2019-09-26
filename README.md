@@ -1,42 +1,25 @@
 # monstache
 a go daemon that syncs mongodb to elasticsearch in realtime
 
-[![Build Status](https://travis-ci.org/rwynn/monstache.svg?branch=master)](https://travis-ci.org/rwynn/monstache)
+[![Build Status](https://travis-ci.org/rwynn/monstache.svg?branch=rel6)](https://travis-ci.org/rwynn/monstache)
 [![Go Report Card](https://goreportcard.com/badge/github.com/rwynn/monstache)](https://goreportcard.com/report/github.com/rwynn/monstache)
 
-### Features
+### Version 6
 
-- Supports up to and including the latest versions of Elasticsearch and MongoDB
+This version of monstache is designed for MongoDB 3.6+ and Elasticsearch 7.0+.  It uses the official MongoDB
+golang driver and the community supported Elasticsearch driver from olivere.
 
-- Single binary with a light footprint 
+Some of the monstache settings related to MongoDB have been removed in this version as they are now supported in the 
+[connection string](https://github.com/mongodb/mongo-go-driver/blob/v1.0.0/x/network/connstring/connstring.go)
 
-- Optionally filter the set of collections to sync
+### Changes from previous versions
 
-- Advanced support for sharded MongoDB clusters including auto-detection of new shards
+Monstache now defaults to use change streams instead of tailing the oplog for changes.  Without any configuration
+monstache watches the entire MongoDB deployment.  You can specify specific namespaces to watch by setting the option
+`change-stream-namespaces` to an array of strings.
 
-- Direct read mode to do a full sync of collections in addition to tailing the oplog
+The interface for golang plugins has changed due to the switch to the new driver. Previously the API exposed
+a `Session` field typed as a `*mgo.Session`.  Now that has been replaced with a `MongoClient` field which has the type
+`*mongo.Client`. 
 
-- Transform and filter documents before indexing using Golang plugins or JavaScript
-
-- Index the content of GridFS files
-
-- Support for hard and soft deletes in MongoDB
-
-- Support for propogating database and collection drops
-
-- Optional custom document routing in Elasticsearch
-
-- Stateful resume feature
-
-- Worker and Clustering modes for High Availability
-
-- Support for [rfc7396](https://tools.ietf.org/html/rfc7396) JSON merge patches
-
-- Systemd support
-
-- Optional http server to get access to liveness, stats, etc
-
-### Documentation
-
-See the [monstache site](https://rwynn.github.io/monstache-site/) for information on configuration and usage.
-
+See the MongoDB go driver docs for details on how to use this client.

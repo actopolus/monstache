@@ -1,24 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/olivere/elastic"
+	"github.com/olivere/elastic/v7"
 	"github.com/rwynn/gtm"
-	"golang.org/x/net/context"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"math"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
 
 /*
 This test requires the following processes to be running on localhost
-	- elasticsearch v6.2+
-	- mongodb
+	- elasticsearch v7.0+
+	- mongodb 4.0+
 	- monstache
 
 monstache should be run with the following settings to force bulk requests
@@ -44,33 +47,52 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-var mongoUrl = getEnv("MONGO_DB_URL", "localhost:27017")
+var mongoURL = getEnv("MONGO_DB_URL", "mongodb://localhost:27017")
 
-var elasticUrl = getEnv("ELASTIC_SEARCH_URL", "http://localhost:9200")
+var elasticURL = getEnv("ELASTIC_SEARCH_URL", "http://localhost:9200")
 
-var elasticUrlConfig = elastic.SetURL(elasticUrl)
+var elasticURLConfig = elastic.SetURL(elasticURL)
 var elasticNoSniffConfig = elastic.SetSniff(false)
 
 func init() {
-	fmt.Printf("MongoDB Url: %v\nElasticsearch Url: %v\n", mongoUrl, elasticUrl)
+	fmt.Printf("MongoDB Url: %v\nElasticsearch Url: %v\n", mongoURL, elasticURL)
 
 	flag.IntVar(&delay, "delay", 3, "Delay between operations in seconds")
 	flag.Parse()
 }
 
-func DropTestDB(t *testing.T, session *mgo.Session) {
-	db := session.DB("test")
-	if err := db.DropDatabase(); err != nil {
+func dialMongo() (*mongo.Client, error) {
+	rb := bson.NewRegistryBuilder()
+	rb.RegisterTypeMapEntry(bsontype.DateTime, reflect.TypeOf(time.Time{}))
+	reg := rb.Build()
+	clientOptions := options.Client()
+	clientOptions.ApplyURI(mongoURL)
+	clientOptions.SetAppName("monstache")
+	clientOptions.SetRegistry(reg)
+	client, err := mongo.NewClient(clientOptions)
+	if err != nil {
+		return nil, err
+	}
+	err = client.Connect(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func DropTestDB(t *testing.T, client *mongo.Client) {
+	db := client.Database("test")
+	if err := db.Drop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func ValidateDocResponse(t *testing.T, doc map[string]string, resp *elastic.GetResult) {
+func ValidateDocResponse(t *testing.T, doc bson.M, resp *elastic.GetResult) {
 	if resp.Id != doc["_id"] {
 		t.Fatalf("elasticsearch id %s does not match mongo id %s", resp.Id, doc["_id"])
 	}
 	var src map[string]interface{}
-	err := json.Unmarshal(*resp.Source, &src)
+	err := json.Unmarshal(resp.Source, &src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +182,7 @@ func TestBuildRelateSelector(t *testing.T) {
 
 func TestOpIdToString(t *testing.T) {
 	var result string
-	var id float64 = 10.0
+	var id = 10.0
 	var id2 int64 = 1
 	var id3 float32 = 12.0
 	op := &gtm.Op{Id: id}
@@ -223,59 +245,25 @@ func TestSetElasticClientScheme(t *testing.T) {
 	}
 }
 
-func TestParseSecureMongoUrl(t *testing.T) {
-	c := &configOptions{MongoURL: "mongo://host:47/db?a=b&ssl=true&c=d"}
-	c.setDefaults()
-	if c.MongoURL != "mongo://host:47/db?a=b&c=d" {
-		t.Fatalf("ssl param not removed from url")
-	}
-	if c.MongoDialSettings.Ssl == false {
-		t.Fatalf("ssl not enabled")
-	}
-	c = &configOptions{MongoURL: "mongo://host:47/db?a=b&c=d&ssl=true"}
-	c.setDefaults()
-	if c.MongoURL != "mongo://host:47/db?a=b&c=d" {
-		t.Fatalf("ssl param not removed from url")
-	}
-	if c.MongoDialSettings.Ssl == false {
-		t.Fatalf("ssl not enabled")
-	}
-	c = &configOptions{MongoURL: "mongo://host:47/db?ssl=true"}
-	c.setDefaults()
-	if c.MongoURL != "mongo://host:47/db" {
-		t.Fatalf("ssl param not removed from url")
-	}
-	if c.MongoDialSettings.Ssl == false {
-		t.Fatalf("ssl not enabled")
-	}
-	c = &configOptions{MongoURL: "mongo://host:47/db?ssl=true&a=b"}
-	c.setDefaults()
-	if c.MongoURL != "mongo://host:47/db?a=b" {
-		t.Fatalf("ssl param not removed from url")
-	}
-	if c.MongoDialSettings.Ssl == false {
-		t.Fatalf("ssl not enabled")
-	}
-}
-
 func TestInsert(t *testing.T) {
-	client, err := elastic.NewClient(elasticUrlConfig, elasticNoSniffConfig)
+	client, err := elastic.NewClient(elasticURLConfig, elasticNoSniffConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := mgo.Dial(mongoUrl)
+	mongoClient, err := dialMongo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	DropTestDB(t, session)
-	col := session.DB("test").C("test")
-	doc := make(map[string]string)
-	doc["_id"] = "1"
-	doc["data"] = "data"
-	if err = col.Insert(doc); err == nil {
+	defer mongoClient.Disconnect(context.Background())
+	DropTestDB(t, mongoClient)
+	col := mongoClient.Database("test").Collection("test")
+	doc := bson.M{
+		"_id":  "1",
+		"data": "data",
+	}
+	if _, err = col.InsertOne(context.Background(), doc); err == nil {
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
@@ -286,33 +274,37 @@ func TestInsert(t *testing.T) {
 }
 
 func TestUpdate(t *testing.T) {
-	client, err := elastic.NewClient(elasticUrlConfig, elasticNoSniffConfig)
+	client, err := elastic.NewClient(elasticURLConfig, elasticNoSniffConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := mgo.Dial(mongoUrl)
+	mongoClient, err := dialMongo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	DropTestDB(t, session)
-	col := session.DB("test").C("test")
-	doc := make(map[string]string)
-	doc["_id"] = "1"
-	doc["data"] = "data"
-	if err = col.Insert(doc); err == nil {
+	defer mongoClient.Disconnect(context.Background())
+	DropTestDB(t, mongoClient)
+	col := mongoClient.Database("test").Collection("test")
+	doc := bson.M{
+		"_id":  "1",
+		"data": "data",
+	}
+	if _, err = col.InsertOne(context.Background(), doc); err == nil {
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
 		}
 		doc["data"] = "updated"
-		if err = col.UpdateId("1", doc); err != nil {
+		sel := bson.M{
+			"_id": "1",
+		}
+		if _, err = col.ReplaceOne(context.Background(), sel, doc); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
@@ -323,34 +315,38 @@ func TestUpdate(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	client, err := elastic.NewClient(elasticUrlConfig, elasticNoSniffConfig)
+	client, err := elastic.NewClient(elasticURLConfig, elasticNoSniffConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := mgo.Dial(mongoUrl)
+	mongoClient, err := dialMongo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	DropTestDB(t, session)
-	col := session.DB("test").C("test")
-	doc := make(map[string]string)
-	doc["_id"] = "1"
-	doc["data"] = "data"
-	if err = col.Insert(doc); err == nil {
+	defer mongoClient.Disconnect(context.Background())
+	DropTestDB(t, mongoClient)
+	col := mongoClient.Database("test").Collection("test")
+	doc := bson.M{
+		"_id":  "1",
+		"data": "data",
+	}
+	if _, err = col.InsertOne(context.Background(), doc); err == nil {
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
 		}
-		if err = col.RemoveId("1"); err != nil {
+		sel := bson.M{
+			"_id": "1",
+		}
+		if _, err = col.DeleteOne(context.Background(), sel); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Duration(delay) * time.Second)
-		_, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background())
+		_, err := client.Get().Index("test.test").Id("1").Do(context.Background())
 		if !elastic.IsNotFound(err) {
-			t.Fatal("clientsearch record not deleted")
+			t.Fatal("record not deleted")
 		}
 	} else {
 		t.Fatal(err)
@@ -358,29 +354,30 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDropDatabase(t *testing.T) {
-	client, err := elastic.NewClient(elasticUrlConfig, elasticNoSniffConfig)
+	client, err := elastic.NewClient(elasticURLConfig, elasticNoSniffConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := mgo.Dial(mongoUrl)
+	mongoClient, err := dialMongo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	DropTestDB(t, session)
-	col := session.DB("test").C("test")
-	doc := make(map[string]string)
-	doc["_id"] = "1"
-	doc["data"] = "data"
-	if err = col.Insert(doc); err == nil {
+	defer mongoClient.Disconnect(context.Background())
+	DropTestDB(t, mongoClient)
+	col := mongoClient.Database("test").Collection("test")
+	doc := bson.M{
+		"_id":  "1",
+		"data": "data",
+	}
+	if _, err = col.InsertOne(context.Background(), doc); err == nil {
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
 		}
-		db := session.DB("test")
-		if err = db.DropDatabase(); err != nil {
+		db := mongoClient.Database("test")
+		if err = db.Drop(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Duration(delay) * time.Second)
@@ -389,7 +386,7 @@ func TestDropDatabase(t *testing.T) {
 			t.Fatal(err)
 		}
 		if exists {
-			t.Fatal("clientsearch index not deleted")
+			t.Fatal("index not deleted")
 		}
 	} else {
 		t.Fatal(err)
@@ -397,28 +394,29 @@ func TestDropDatabase(t *testing.T) {
 }
 
 func TestDropCollection(t *testing.T) {
-	client, err := elastic.NewClient(elasticUrlConfig, elasticNoSniffConfig)
+	client, err := elastic.NewClient(elasticURLConfig, elasticNoSniffConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := mgo.Dial(mongoUrl)
+	mongoClient, err := dialMongo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	DropTestDB(t, session)
-	col := session.DB("test").C("test")
-	doc := make(map[string]string)
-	doc["_id"] = "1"
-	doc["data"] = "data"
-	if err = col.Insert(doc); err == nil {
+	defer mongoClient.Disconnect(context.Background())
+	DropTestDB(t, mongoClient)
+	col := mongoClient.Database("test").Collection("test")
+	doc := bson.M{
+		"_id":  "1",
+		"data": "data",
+	}
+	if _, err = col.InsertOne(context.Background(), doc); err == nil {
 		time.Sleep(time.Duration(delay) * time.Second)
-		if resp, err := client.Get().Index("test.test").Type("_doc").Id("1").Do(context.Background()); err == nil {
+		if resp, err := client.Get().Index("test.test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
 		} else {
 			t.Fatal(err)
 		}
-		if err = col.DropCollection(); err != nil {
+		if err = col.Drop(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Duration(delay) * time.Second)
@@ -427,7 +425,7 @@ func TestDropCollection(t *testing.T) {
 			t.Fatal(err)
 		}
 		if exists {
-			t.Fatal("clientsearch index not deleted")
+			t.Fatal("index not deleted")
 		}
 	} else {
 		t.Fatal(err)

@@ -1,16 +1,14 @@
-gzip = true
-
 mongo-url = "mongodb://root-user:password@mongo-0:27017"
 
-elasticsearch-urls = ["http://es6:9200"]
+change-stream-namespaces = [""]
 
-elasticsearch-max-conns = 10
+elasticsearch-urls = ["http://es7:9200"]
+
+elasticsearch-max-conns = 1
 
 elasticsearch-max-seconds = 1
 
 elasticsearch-max-docs = 1
-
-namespace-regex = '^test\.(test|\$cmd)$'
 
 verbose = true
 

@@ -19,7 +19,7 @@ services:
     depends_on:
       mongo-0:
         condition: service_started
-      es6:
+      es7:
         condition: service_healthy
     ports:
       - "8080:8080"
@@ -43,18 +43,18 @@ services:
     depends_on:
       mongo-0:
         condition: service_started
-      es6:
+      es7:
         condition: service_healthy
       monstache:
         condition: service_healthy
     environment:
       MONGO_DB_URL: 'mongodb://root-user:password@mongo-0:27017'
-      ELASTIC_SEARCH_URL: 'http://es6:9200'
+      ELASTIC_SEARCH_URL: 'http://es7:9200'
     networks:
       - test
 
   mongo-0:
-    image: mongo:3.4.14-jessie
+    image: mongo:4.1-xenial
     logging:
       driver: none
     container_name: c-mongo
@@ -90,11 +90,13 @@ services:
       retries: 300
     restart: unless-stopped
 
-  es6:
-    image: docker.elastic.co/elasticsearch/elasticsearch-oss:6.2.4
+  es7:
+    image: docker.elastic.co/elasticsearch/elasticsearch-oss:7.0.0
     logging:
       driver: none
     container_name: c-es
+    environment:
+        - discovery.type=single-node
     # volumes:
     #   - ./elasticsearch/elasticsearch.config.yml:/usr/share/elasticsearch/config/elasticsearch.yml
     ports:

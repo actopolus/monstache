@@ -1,9 +1,9 @@
 package monstachemap
 
 import (
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/olivere/elastic"
+	"github.com/olivere/elastic/v7"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 // plugins must import this package
@@ -22,7 +22,7 @@ type MapperPluginInput struct {
 	Collection        string                 // the origin collection in MongoDB
 	Namespace         string                 // the entire namespace for the original document
 	Operation         string                 // "i" for a insert or "u" for update
-	Session           *mgo.Session           // MongoDB session handle
+	MongoClient       *mongo.Client          // MongoDB driver client
 	UpdateDescription map[string]interface{} // map describing changes to the document
 }
 
@@ -46,7 +46,7 @@ type MapperPluginOutput struct {
 // ProcessPluginInput is the input to the Process function
 type ProcessPluginInput struct {
 	MapperPluginInput
-	ElasticClient        *elastic.Client
-	ElasticBulkProcessor *elastic.BulkProcessor
-	Timestamp            bson.MongoTimestamp
+	ElasticClient        *elastic.Client        // Elasticsearch driver client
+	ElasticBulkProcessor *elastic.BulkProcessor // Elasticsearch processor for indexing in bulk
+	Timestamp            primitive.Timestamp    // the timestamp of the event from the oplog
 }
