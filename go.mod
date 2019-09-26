@@ -9,9 +9,10 @@ require (
 	github.com/golang/snappy v0.0.1 // indirect
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/olivere/elastic/v7 v7.0.0
+	github.com/pkg/errors v0.8.1
 	github.com/robertkrimen/otto v0.0.0-20180617131154-15f95af6e78d
 	github.com/rwynn/gtm v0.0.0-20190709183103-9eb0bcfe66ed
-	github.com/serialx/hashring v0.0.0-20180504054112-49a4782e9908 // indirect
+	github.com/serialx/hashring v0.0.0-20180504054112-49a4782e9908
 	github.com/tidwall/pretty v0.0.0-20190325153808-1166b9ac2b65 // indirect
 	github.com/xdg/scram v0.0.0-20180814205039-7eeb5667e42c // indirect
 	github.com/xdg/stringprep v1.0.0 // indirect

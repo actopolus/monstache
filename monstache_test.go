@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/olivere/elastic/v7"
-	"github.com/rwynn/gtm"
+	"github.com/rwynn/monstache/gtm"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/mongo"

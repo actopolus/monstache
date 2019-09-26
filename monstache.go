@@ -19,8 +19,8 @@ import (
 	aws "github.com/olivere/elastic/v7/aws/v4"
 	"github.com/robertkrimen/otto"
 	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
+	"github.com/rwynn/monstache/gtm"
+	"github.com/rwynn/monstache/gtm/consistent"
 	"github.com/rwynn/monstache/monstachemap"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -89,6 +89,8 @@ const postProcessorsDefault = 10
 const redact = "REDACTED"
 const configDatabaseNameDefault = "monstache"
 const relateQueueOverloadMsg = "Relate queue is full. Skipping relate for %v.(%v) to keep pipeline healthy."
+const timestampMultiplier = 1000
+const clusterNodeTTL = int32(30) // ttl for node in seconds
 
 type deleteStrategy int
 
@@ -108,6 +110,7 @@ type indexClient struct {
 	gtmCtx      *gtm.OpCtxMulti
 	config      *configOptions
 	mongo       *mongo.Client
+	fdbManager  *gtm.FDBStreamManager
 	mongoConfig *mongo.Client
 	bulk        *elastic.BulkProcessor
 	bulkStats   *elastic.BulkProcessor
@@ -121,8 +124,8 @@ type indexClient struct {
 	closeC      chan bool
 	doneC       chan int
 	enabled     bool
-	lastTs      primitive.Timestamp
-	lastTsSaved primitive.Timestamp
+	lastTs      int64
+	lastTsSaved int64
 	indexC      chan *gtm.Op
 	processC    chan *gtm.Op
 	fileC       chan *gtm.Op
@@ -226,7 +229,6 @@ type configOptions struct {
 	EnableTemplate           bool
 	EnvDelimiter             string
 	MongoURL                 string      `toml:"mongo-url"`
-	MongoConfigURL           string      `toml:"mongo-config-url"`
 	MongoOpLogDatabaseName   string      `toml:"mongo-oplog-database-name"`
 	MongoOpLogCollectionName string      `toml:"mongo-oplog-collection-name"`
 	GtmSettings              gtmSettings `toml:"gtm-settings"`
@@ -241,6 +243,10 @@ type configOptions struct {
 	ElasticVersion           string      `toml:"elasticsearch-version"`
 	ElasticHealth0           int         `toml:"elasticsearch-healthcheck-timeout-startup"`
 	ElasticHealth1           int         `toml:"elasticsearch-healthcheck-timeout"`
+	FDBStreamUrls            []string    `toml:"fdb-stream-urls"`
+	FDBReconnectDelay        string      `toml:"fdb-reconnect-delay"`
+	FDBReadTimeout           string      `toml:"fdb-read-timeout"`
+	FDBFetchDocs             bool        `toml:"fdb-fetch-docs"`
 	ResumeName               string      `toml:"resume-name"`
 	NsRegex                  string      `toml:"namespace-regex"`
 	NsDropRegex              string      `toml:"namespace-drop-regex"`
@@ -367,10 +373,6 @@ func (args *stringargs) String() string {
 func (args *stringargs) Set(value string) error {
 	*args = append(*args, value)
 	return nil
-}
-
-func (config *configOptions) readShards() bool {
-	return len(config.ChangeStreamNs) == 0 && config.MongoConfigURL != ""
 }
 
 func (config *configOptions) dynamicDirectReadList() bool {
@@ -967,10 +969,7 @@ func (ic *indexClient) processRelated(root *gtm.Op) (err error) {
 						continue
 					}
 					now := time.Now().UTC()
-					tstamp := primitive.Timestamp{
-						T: uint32(now.Unix()),
-						I: uint32(now.Nanosecond()),
-					}
+					tstamp := now.Unix()
 					rop := &gtm.Op{
 						Id:                doc["_id"],
 						Data:              doc,
@@ -1042,7 +1041,7 @@ func (ic *indexClient) prepareDataForIndexing(op *gtm.Op) {
 	config := ic.config
 	data := op.Data
 	if config.IndexOplogTime {
-		secs := op.Timestamp.T
+		secs := op.Timestamp
 		t := time.Unix(int64(secs), 0).UTC()
 		data[config.OplogTsFieldName] = op.Timestamp
 		data[config.OplogDateFieldName] = t.Format(config.OplogDateFieldFormat)
@@ -1057,7 +1056,7 @@ func (ic *indexClient) prepareDataForIndexing(op *gtm.Op) {
 
 func parseIndexMeta(op *gtm.Op) (meta *indexingMeta) {
 	meta = &indexingMeta{
-		Version:     tsVersion(op.Timestamp),
+		Version:     op.Timestamp,
 		VersionType: "external",
 	}
 	if m, ok := op.Data["_meta_monstache"]; ok {
@@ -1233,7 +1232,7 @@ func (ic *indexClient) ensureClusterTTL() error {
 	io := options.Index()
 	io.SetName("expireAt")
 	io.SetBackground(true)
-	io.SetExpireAfterSeconds(30)
+	io.SetExpireAfterSeconds(clusterNodeTTL)
 	im := mongo.IndexModel{
 		Keys:    bson.M{"expireAt": 1},
 		Options: io,
@@ -1244,53 +1243,46 @@ func (ic *indexClient) ensureClusterTTL() error {
 	return err
 }
 
-func (ic *indexClient) enableProcess() (bool, error) {
-	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("cluster")
-	doc := bson.M{}
-	doc["_id"] = ic.config.ResumeName
-	doc["expireAt"] = time.Now().UTC()
-	doc["pid"] = os.Getpid()
-	if host, err := os.Hostname(); err == nil {
-		doc["host"] = host
-	} else {
-		return false, err
-	}
-	_, err := col.InsertOne(context.Background(), doc)
-	if err == nil {
-		return true, nil
-	}
-	if isDup(err) {
+// ensureClusterExpiration - check cluster expiration
+func (ic *indexClient) ensureClusterExpiration(
+	col *mongo.Collection,
+	resume string,
+	pid int,
+	host string,
+	expired time.Time) (bool, error) {
+	doc := bson.M{"_id": resume, "expireAt": time.Now().UTC(), "pid": pid, "host": host}
+	filter := bson.M{"_id": resume, "expireAt": bson.M{"$lte": expired}}
+
+	opts := options.FindOneAndReplace().SetUpsert(true).SetReturnDocument(options.After)
+	result := col.FindOneAndReplace(context.Background(), filter, doc, opts)
+
+	afterDoc := make(map[string]interface{})
+	if err := result.Decode(&afterDoc); err != nil {
 		return false, nil
 	}
-	return false, err
+
+	aPid := afterDoc["pid"].(int32)
+	aHost := afterDoc["host"].(string)
+
+	if int(aPid) == pid && aHost == host {
+		return true, nil
+	}
+
+	return false, nil
 }
 
-func isDup(err error) bool {
-	checkCodeAndMessage := func(code int, message string) bool {
-		return code == 11000 ||
-			code == 11001 ||
-			code == 12582 ||
-			strings.Contains(message, "E11000")
+func (ic *indexClient) enableProcess() (bool, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		return false, err
 	}
-	if we, ok := err.(mongo.WriteException); ok {
-		if we.WriteConcernError != nil {
-			wce := we.WriteConcernError
-			code, message := wce.Code, wce.Message
-			if checkCodeAndMessage(code, message) {
-				return true
-			}
-		}
-		if we.WriteErrors != nil {
-			we := we.WriteErrors
-			for _, e := range we {
-				code, message := e.Code, e.Message
-				if checkCodeAndMessage(code, message) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+
+	return ic.ensureClusterExpiration(
+		ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("cluster"),
+		ic.config.ResumeName,
+		os.Getpid(),
+		host,
+		time.Now().Add(-time.Second*time.Duration(clusterNodeTTL)).UTC())
 }
 
 func (ic *indexClient) resetClusterState() error {
@@ -1336,7 +1328,7 @@ func (ic *indexClient) resumeWork() {
 		doc := make(map[string]interface{})
 		if err = result.Decode(&doc); err == nil {
 			if doc["ts"] != nil {
-				ts := doc["ts"].(primitive.Timestamp)
+				ts := doc["ts"].(int64)
 				ic.gtmCtx.Since(ts)
 			}
 		}
@@ -1375,7 +1367,6 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.EnableTemplate, "tpl", false, "True to interpret the config file as a template")
 	flag.StringVar(&config.EnvDelimiter, "env-delimiter", ",", "A delimiter to use when splitting environment variable values")
 	flag.StringVar(&config.MongoURL, "mongo-url", "", "MongoDB server or router server connection URL")
-	flag.StringVar(&config.MongoConfigURL, "mongo-config-url", "", "MongoDB config server connection URL")
 	flag.StringVar(&config.MongoOpLogDatabaseName, "mongo-oplog-database-name", "", "Override the database name which contains the mongodb oplog")
 	flag.StringVar(&config.MongoOpLogCollectionName, "mongo-oplog-collection-name", "", "Override the collection name which contains the mongodb oplog")
 	flag.StringVar(&config.GraylogAddr, "graylog-addr", "", "Send logs to a Graylog server at this address")
@@ -1394,6 +1385,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.IntVar(&config.ElasticMaxBytes, "elasticsearch-max-bytes", 0, "Number of bytes to hold before flushing to Elasticsearch")
 	flag.IntVar(&config.ElasticMaxSeconds, "elasticsearch-max-seconds", 0, "Number of seconds before flushing to Elasticsearch")
 	flag.IntVar(&config.ElasticClientTimeout, "elasticsearch-client-timeout", 0, "Number of seconds before a request to Elasticsearch is timed out")
+	flag.BoolVar(&config.FDBFetchDocs, "fdb-fetch-docs", false, "True to enable fetching updated docs from mongo for fdb")
 	flag.Int64Var(&config.MaxFileSize, "max-file-size", 0, "GridFs file content exceeding this limit in bytes will not be indexed in Elasticsearch")
 	flag.StringVar(&config.ConfigFile, "f", "", "Location of configuration file")
 	flag.BoolVar(&config.DroppedDatabases, "dropped-databases", true, "True to delete indexes from dropped databases")
@@ -1731,11 +1723,18 @@ func (config *configOptions) loadConfigFile() *configOptions {
 				errorLog.Fatalf("Config file contains undecoded keys: %q", ud)
 			}
 		}
+
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
 		}
-		if config.MongoConfigURL == "" {
-			config.MongoConfigURL = tomlConfig.MongoConfigURL
+		if config.FDBReadTimeout == "" {
+			config.FDBReadTimeout = tomlConfig.FDBReadTimeout
+		}
+		if config.FDBReconnectDelay == "" {
+			config.FDBReconnectDelay = tomlConfig.FDBReconnectDelay
+		}
+		if len(config.FDBStreamUrls) == 0 {
+			config.FDBStreamUrls = tomlConfig.FDBStreamUrls
 		}
 		if config.MongoOpLogDatabaseName == "" {
 			config.MongoOpLogDatabaseName = tomlConfig.MongoOpLogDatabaseName
@@ -1820,6 +1819,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		}
 		if config.DroppedCollections && !tomlConfig.DroppedCollections {
 			config.DroppedCollections = false
+		}
+		if !config.FDBFetchDocs && tomlConfig.FDBFetchDocs {
+			config.FDBFetchDocs = true
 		}
 		if !config.Gzip && tomlConfig.Gzip {
 			config.Gzip = true
@@ -2049,6 +2051,7 @@ func (config *configOptions) build() *configOptions {
 	config.loadConfigFile()
 	config.loadPlugins()
 	config.setDefaults()
+
 	return config
 }
 
@@ -2070,11 +2073,6 @@ func (config *configOptions) loadEnvironment() *configOptions {
 		case "MONSTACHE_MONGO_URL":
 			if config.MongoURL == "" {
 				config.MongoURL = val
-			}
-			break
-		case "MONSTACHE_MONGO_CONFIG_URL":
-			if config.MongoConfigURL == "" {
-				config.MongoConfigURL = val
 			}
 			break
 		case "MONSTACHE_MONGO_OPLOG_DB":
@@ -2231,9 +2229,6 @@ func (config *configOptions) loadGridFsConfig() *configOptions {
 func (config configOptions) dump() {
 	if config.MongoURL != "" {
 		config.MongoURL = cleanMongoURL(config.MongoURL)
-	}
-	if config.MongoConfigURL != "" {
-		config.MongoConfigURL = cleanMongoURL(config.MongoConfigURL)
 	}
 	if config.ElasticUser != "" {
 		config.ElasticUser = redact
@@ -2525,7 +2520,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 	if op.IsSourceDirect() {
 		return nil
 	}
-	if op.Timestamp.T == 0 {
+	if op.Timestamp == 0 {
 		return nil
 	}
 	client, config := ic.client, ic.config
@@ -2565,7 +2560,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 						if toJSON, err = json.Marshal(op.Data); err == nil {
 							if mergeDoc, err = jsonpatch.CreateMergePatch(fromJSON, toJSON); err == nil {
 								merge := make(map[string]interface{})
-								merge["ts"] = op.Timestamp.T
+								merge["ts"] = op.Timestamp
 								merge["p"] = string(mergeDoc)
 								merge["v"] = len(merges) + 1
 								merges = append(merges, merge)
@@ -2584,7 +2579,7 @@ func (ic *indexClient) addPatch(op *gtm.Op, objectID string,
 			if toJSON, err = json.Marshal(op.Data); err == nil {
 				merge := make(map[string]interface{})
 				merge["v"] = 1
-				merge["ts"] = op.Timestamp.T
+				merge["ts"] = op.Timestamp
 				merge["p"] = string(toJSON)
 				merges = append(merges, merge)
 				op.Data[config.MergePatchAttr] = merges
@@ -2697,7 +2692,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 			}
 			data["_source_id"] = objectID
 			if ic.config.IndexOplogTime == false {
-				secs := int64(op.Timestamp.T)
+				secs := op.Timestamp
 				t := time.Unix(secs, 0).UTC()
 				data[ic.config.OplogTsFieldName] = op.Timestamp
 				data[ic.config.OplogDateFieldName] = t.Format(ic.config.OplogDateFieldFormat)
@@ -3443,7 +3438,7 @@ func (ic *indexClient) doDelete(op *gtm.Op) {
 	objectID, indexType, meta := opIDToString(op), ic.mapIndex(op), &indexingMeta{}
 	req.Id(objectID)
 	if ic.config.IndexAsUpdate == false {
-		req.Version(tsVersion(op.Timestamp))
+		req.Version(op.Timestamp)
 		req.VersionType("external")
 	}
 	if ic.config.DeleteStrategy == statefulDeleteStrategy {
@@ -3801,43 +3796,20 @@ func (ic *indexClient) startReadWait() {
 	}
 }
 
-func (ic *indexClient) dialShards() []*mongo.Client {
-	var mongos []*mongo.Client
-	// get the list of shard servers
-	shardInfos := gtm.GetShards(ic.mongoConfig)
-	if len(shardInfos) == 0 {
-		errorLog.Fatalln("Shards enabled but none found in config.shards collection")
-	}
-	// add each shard server to the sync list
-	for _, shardInfo := range shardInfos {
-		shardURL := shardInfo.GetURL()
-		infoLog.Printf("Adding shard found at %s\n", cleanMongoURL(shardURL))
-		shard, err := ic.config.dialMongo(shardURL)
-		if err != nil {
-			errorLog.Fatalf("Unable to connect to mongodb shard using URL %s: %s", cleanMongoURL(shardURL), err)
-		}
-		mongos = append(mongos, shard)
-	}
-	return mongos
-}
-
 func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 	var after gtm.TimestampGenerator
 	config := ic.config
 	if config.Replay {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			return primitive.Timestamp{}, nil
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			return 0, nil
 		}
 	} else if config.ResumeFromTimestamp != 0 {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			return primitive.Timestamp{
-				T: uint32(config.ResumeFromTimestamp >> 32),
-				I: uint32(config.ResumeFromTimestamp),
-			}, nil
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			return config.ResumeFromTimestamp >> 32, nil
 		}
 	} else if config.Resume {
-		after = func(client *mongo.Client, options *gtm.Options) (primitive.Timestamp, error) {
-			var ts primitive.Timestamp
+		after = func(client *mongo.Client, options *gtm.Options) (int64, error) {
+			var ts int64
 			var err error
 			col := client.Database(config.ConfigDatabaseName).Collection("monstache")
 			result := col.FindOne(context.Background(), bson.M{
@@ -3847,12 +3819,11 @@ func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 				doc := make(map[string]interface{})
 				if err = result.Decode(&doc); err == nil {
 					if doc["ts"] != nil {
-						ts = doc["ts"].(primitive.Timestamp)
-						ts.I++
+						ts = doc["ts"].(int64)
 					}
 				}
 			}
-			if ts.T == 0 {
+			if ts == 0 {
 				ts, _ = gtm.LastOpTimestamp(client, options)
 			}
 			infoLog.Printf("Resuming from timestamp %+v", ts)
@@ -3864,28 +3835,13 @@ func (ic *indexClient) buildTimestampGen() gtm.TimestampGenerator {
 
 func (ic *indexClient) buildConnections() []*mongo.Client {
 	var mongos []*mongo.Client
-	var err error
-	config := ic.config
-	if config.readShards() {
-		// if we have a config server URL then we are running in a sharded cluster
-		ic.mongoConfig, err = config.dialMongo(config.MongoConfigURL)
-		if err != nil {
-			errorLog.Fatalf("Unable to connect to mongodb config server using URL %s: %s",
-				cleanMongoURL(config.MongoConfigURL), err)
-		}
-		mongos = ic.dialShards()
-	} else {
-		mongos = append(mongos, ic.mongo)
-	}
+	mongos = append(mongos, ic.mongo)
 	return mongos
 }
 
 func (ic *indexClient) buildFilterChain() []gtm.OpFilter {
 	config := ic.config
 	filterChain := []gtm.OpFilter{notMonstache(config), notSystem, notChunks}
-	if config.readShards() {
-		filterChain = append(filterChain, notConfig)
-	}
 	if config.NsRegex != "" {
 		filterChain = append(filterChain, filterWithRegex(config.NsRegex))
 	}
@@ -4002,6 +3958,7 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 	if config.dynamicDirectReadList() {
 		config.DirectReadNs = ic.buildDynamicDirectReadNs(nsFilter)
 	}
+
 	gtmOpts := &gtm.Options{
 		After:               after,
 		Filter:              filter,
@@ -4022,17 +3979,14 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 		Log:                 infoLog,
 		Pipe:                buildPipe(config),
 		ChangeStreamNs:      config.ChangeStreamNs,
+		FetchDocs:           config.FDBFetchDocs,
 	}
 	return gtmOpts
 }
 
 func (ic *indexClient) startListen() {
-	config := ic.config
 	gtmOpts := ic.buildGtmOptions()
-	ic.gtmCtx = gtm.StartMulti(ic.buildConnections(), gtmOpts)
-	if config.readShards() && !config.DisableChangeEvents {
-		ic.gtmCtx.AddShardListener(ic.mongoConfig, gtmOpts, config.makeShardInsertHandler())
-	}
+	ic.gtmCtx = gtm.StartMulti(ic.buildConnections(), ic.fdbManager, gtmOpts)
 }
 
 func (ic *indexClient) clusterWait() {
@@ -4062,8 +4016,7 @@ func (ic *indexClient) clusterWait() {
 }
 
 func (ic *indexClient) nextTimestamp() {
-	if ic.lastTs.T > ic.lastTsSaved.T ||
-		(ic.lastTs.T == ic.lastTsSaved.T && ic.lastTs.I > ic.lastTsSaved.I) {
+	if ic.lastTs > ic.lastTsSaved {
 		ic.bulk.Flush()
 		if err := ic.saveTimestamp(); err == nil {
 			ic.lastTsSaved = ic.lastTs
@@ -4299,15 +4252,8 @@ func getBuildInfo(client *mongo.Client) (bi *buildInfo, err error) {
 }
 
 func (ic *indexClient) saveTimestampFromReplStatus() {
-	if rs, err := gtm.GetReplStatus(ic.mongo); err == nil {
-		if ic.lastTs, err = rs.GetLastCommitted(); err == nil {
-			if err = ic.saveTimestamp(); err != nil {
-				ic.processErr(err)
-			}
-		} else {
-			ic.processErr(err)
-		}
-	} else {
+	ic.lastTs = time.Now().UTC().Unix() * timestampMultiplier
+	if err := ic.saveTimestamp(); err != nil {
 		ic.processErr(err)
 	}
 }
@@ -4329,6 +4275,11 @@ func mustConfig() *configOptions {
 	config.setupLogging()
 	config.validate()
 	return config
+}
+
+func buildFDBStream(config *configOptions) gtm.FDBStreamManager {
+	cl := gtm.NewFDBStreamClient(config.FDBStreamUrls, config.FDBReadTimeout, infoLog)
+	return gtm.NewFDBStreamManager(&cl, config.FDBReconnectDelay, infoLog)
 }
 
 func buildMongoClient(config *configOptions) *mongo.Client {
@@ -4370,6 +4321,7 @@ func main() {
 	config := mustConfig()
 
 	mongoClient := buildMongoClient(config)
+	fdbManager := buildFDBStream(config)
 	loadBuiltinFunctions(mongoClient, config)
 
 	elasticClient := buildElasticClient(config)
@@ -4390,6 +4342,7 @@ func main() {
 		processC:    make(chan *gtm.Op),
 		fileC:       make(chan *gtm.Op),
 		relateC:     make(chan *gtm.Op, config.RelateBuffer),
+		fdbManager:  &fdbManager,
 	}
 
 	ic.run()
