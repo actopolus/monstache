@@ -18,6 +18,12 @@ type FDBStreamManager struct {
 	reconnectAfter time.Duration
 }
 
+const (
+	BUFFER_SIZE_PROCESSOR = 1024
+	BUFFER_SIZE_OPLOG     = 512
+	BATCH_SIZE            = 512
+)
+
 // NewFDBStreamManager - create new manager for fdb stream
 func NewFDBStreamManager(client *FDBStreamClient, reconnectAfter string, logger *log.Logger) FDBStreamManager {
 	reconnectDuration, err := time.ParseDuration(reconnectAfter)
@@ -34,13 +40,13 @@ func (f *FDBStreamManager) getOplogCursor(
 	after, before int64,
 	o *Options) (*mongo.Cursor, error) {
 	query := bson.M{
-		"ts":          bson.M{"$gt": after, "$lte": before},
-		"op":          bson.M{"$in": opCodes},
-		"fromMigrate": bson.M{"$exists": false},
+		"ts": bson.M{"$gt": after, "$lte": before},
 	}
 	opts := &options.FindOptions{}
-	opts.SetSort(bson.M{"$natural": 1})
-	opts.SetCursorType(options.TailableAwait)
+	opts.SetNoCursorTimeout(true)
+	opts.SetBatchSize(BATCH_SIZE)
+	opts.SetHint("_ts_ind")
+
 	collection := OpLogCollection(client, o)
 	return collection.Find(context.Background(), query, opts)
 }
@@ -59,6 +65,7 @@ func (f *FDBStreamManager) fetchOplog(
 ) error {
 	f.logger.Println("fdbStreamManager: resumed from:", tsFrom)
 	f.logger.Println("fdbStreamManager: resumed to:", tsTo)
+	f.logger.Println("Started fetching oplog data...")
 
 OuterLoop:
 	for {
@@ -86,13 +93,14 @@ OuterLoop:
 		}
 	}
 
+	f.logger.Println("Finished fetching oplog data")
 	return nil
 }
 
 // Resume - resume from timestamp
 func (f *FDBStreamManager) Resume(ctx context.Context, client *mongo.Client, options *Options, ts int64) chan OpLog {
-	oplog := make(chan OpLog)
-	bufferCh := make(chan OpLog)
+	oplog := make(chan OpLog, BUFFER_SIZE_OPLOG)
+	bufferCh := make(chan OpLog, BUFFER_SIZE_PROCESSOR)
 	firstDoc := true
 	var fdMtx sync.RWMutex
 
@@ -130,8 +138,13 @@ func (f *FDBStreamManager) Resume(ctx context.Context, client *mongo.Client, opt
 		for msg := range bufferCh {
 			if fnIsFirstDoc() {
 				fnSetFirstDoc(false)
-				if err := f.fetchOplog(ctx, client, options, ts, msg.Timestamp, oplog); err != nil {
-					f.logger.Println("fdbStreamManager (fetching ops error):", err)
+
+				for {
+					if err := f.fetchOplog(ctx, client, options, ts, msg.Timestamp, oplog); err != nil {
+						f.logger.Println("fdbStreamManager (fetching ops error):", err)
+						continue
+					}
+					break
 				}
 			}
 			ts = msg.Timestamp

@@ -11,7 +11,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/network/connection"
 	"log"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -497,27 +496,6 @@ func unwrapErr(err error) error {
 		}
 	}
 	return err
-}
-
-func positionLost(ec errchk) bool {
-	err := unwrapErr(ec.Err())
-	if err != nil {
-		if ce, ok := err.(mongo.CommandError); ok {
-			code := ce.Code
-			if code == 136 { // cursor capped position lost
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func cursorTimeout(ec errchk) bool {
-	err := unwrapErr(ec.Err())
-	if et, ok := err.(net.Error); ok {
-		return et.Timeout() || et.Temporary()
-	}
-	return false
 }
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
